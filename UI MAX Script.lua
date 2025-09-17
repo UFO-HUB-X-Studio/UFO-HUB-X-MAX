@@ -1,25 +1,20 @@
 -- UI MAX Script.lua
--- UFO HUB X — Boot Loader (Key → Download → Main UI)
--- รองรับ Delta / syn / KRNL / Script-Ware / Fluxus / Solara ฯลฯ + loadstring(HttpGet)
--- จัดเต็ม: Patch Key/Download ให้ยิงสัญญาณ, Watchers หลายชั้น, Retry/Backoff, Force Main fallback
+-- UFO HUB X — Boot + Game Detector + Feature Orchestrator
 
---========================================================
--- Services + Compat
---========================================================
+----------------------------- Services -----------------------------
 local HttpService = game:GetService("HttpService")
+local Players     = game:GetService("Players")
+local MPS         = game:GetService("MarketplaceService")
+local LocalPlayer = Players.LocalPlayer
 
-local function log(s)
-    s = "[UFO-HUB-X] "..tostring(s)
-    if rconsoleprint then rconsoleprint(s.."\n") else print(s) end
-end
-
+----------------------------- Helpers ------------------------------
 local function http_get(url)
     if http and http.request then
-        local ok, res = pcall(http.request, {Url=url, Method="GET"})
+        local ok,res = pcall(http.request, {Url=url, Method="GET"})
         if ok and res and (res.Body or res.body) then return true, (res.Body or res.body) end
     end
     if syn and syn.request then
-        local ok, res = pcall(syn.request, {Url=url, Method="GET"})
+        local ok,res = pcall(syn.request, {Url=url, Method="GET"})
         if ok and res and (res.Body or res.body) then return true, (res.Body or res.body) end
     end
     local ok, body = pcall(function() return game:HttpGet(url) end)
@@ -27,44 +22,20 @@ local function http_get(url)
     return false, "httpget_failed"
 end
 
-local function http_get_retry(urls, tries, delay_s)
-    -- urls = string หรือ {string, string2, ...}
-    local list = {}
-    if type(urls)=="table" then list = urls else list = {urls} end
-    tries   = tries or 3
-    delay_s = delay_s or 0.75
-    local attempt = 0
-    for round=1, tries do
-        for _,u in ipairs(list) do
-            attempt += 1
-            log(("HTTP try #%d → %s"):format(attempt, u))
-            local ok, body = http_get(u)
-            if ok and body then return true, body, u end
-        end
-        task.wait(delay_s * round) -- ค่อย ๆ เพิ่มเวลาเล็กน้อย
-    end
-    return false, "retry_failed"
+local function load_from(url)
+    local ok, src = http_get(url)
+    if not ok then warn("[UFO] HttpGet fail:", src); return false end
+    local f,err = loadstring(src)
+    if not f then warn("[UFO] loadstring fail:", err); return false end
+    local ok2, ret = pcall(f)
+    if not ok2 then warn("[UFO] run fail:", ret); return false end
+    return true, ret
 end
 
-local function safe_loadstring(src, tag)
-    local f, e = loadstring(src, tag or "chunk")
-    if not f then return false, "loadstring: "..tostring(e) end
-    local ok, err = pcall(f)
-    if not ok then return false, "pcall: "..tostring(err) end
-    return true
-end
-
---========================================================
--- FS: Persist key state (ใช้ได้ถ้ามี isfolder/readfile/writefile)
---========================================================
+----------------------------- Persist ------------------------------
 local DIR        = "UFOHubX"
 local STATE_FILE = DIR.."/key_state.json"
-local function ensureDir()
-    if isfolder then
-        if not isfolder(DIR) then pcall(makefolder, DIR) end
-    end
-end
-ensureDir()
+if isfolder and not isfolder(DIR) then pcall(makefolder, DIR) end
 
 local function readState()
     if not (isfile and readfile and isfile(STATE_FILE)) then return nil end
@@ -76,256 +47,157 @@ local function readState()
 end
 
 local function writeState(tbl)
-    if not (writefile and HttpService and tbl) then return end
+    if not (writefile and tbl) then return end
     local ok, json = pcall(function() return HttpService:JSONEncode(tbl) end)
     if ok then pcall(writefile, STATE_FILE, json) end
 end
 
---========================================================
--- Config
---========================================================
-local URL_KEYS = {
-    "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X/refs/heads/main/UFO%20HUB%20X%20key.lua",
-    -- เพิ่ม mirror ได้ที่นี่
-}
-local URL_DOWNLOADS = {
-    "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X-2/refs/heads/main/UFO%20HUB%20X%20Download.lua",
-}
-local URL_MAINS = {
-    "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X-3/refs/heads/main/UFO%20HUB%20X%20UI.lua",
-}
-
-local ALLOW_KEYS = {
-    ["JJJMAX"]                = { permanent=true,  reusable=true, expires_at=nil },
-    ["GMPANUPHONGARTPHAIRIN"] = { permanent=true,  reusable=true, expires_at=nil },
-}
-
-local function normKey(s)
-    s = tostring(s or ""):gsub("%c",""):gsub("%s+",""):gsub("[^%w]","")
-    return string.upper(s)
-end
-
---========================================================
--- Key state helpers
---========================================================
-local function isKeyStillValid(state)
-    if not state or not state.key then return false end
-    if state.permanent == true then return true end
-    if state.expires_at and typeof(state.expires_at)=="number" then
-        if os.time() < state.expires_at then return true end
+local function isKeyStillValid()
+    local st = readState()
+    if not st or not st.key then return false end
+    if st.permanent == true then return true end
+    if st.expires_at and typeof(st.expires_at)=="number" then
+        return (os.time() < st.expires_at)
     end
     return false
 end
 
-local function saveKeyState(key, expires_at, permanent)
-    local st = {
-        key        = key,
-        permanent  = permanent and true or false,
-        expires_at = expires_at or nil,
-        saved_at   = os.time(),
-    }
-    writeState(st)
-end
-
---========================================================
--- Global callbacks (ให้ Key/Download/Main UI เรียก)
---========================================================
+-- Callback ให้ไฟล์ Key เรียกกลับมาตอนผ่าน
 _G.UFO_SaveKeyState = function(key, expires_at, permanent)
-    log(("SaveKeyState: key=%s exp=%s perm=%s"):format(tostring(key), tostring(expires_at), tostring(permanent)))
-    saveKeyState(key, expires_at, permanent)
-    _G.UFO_HUBX_KEY_OK   = true
-    _G.UFO_HUBX_KEY      = key
-    _G.UFO_HUBX_KEY_EXP  = expires_at
-    _G.UFO_HUBX_KEY_PERM = permanent and true or false
+    writeState({ key = key, expires_at = expires_at, permanent = permanent == true })
 end
 
-_G.UFO_StartDownload = function()
-    if _G.__UFO_Download_Started then return end
-    _G.__UFO_Download_Started = true
-    log("Start Download UI (signal)")
-    local ok, src, used = http_get_retry(URL_DOWNLOADS, 5, 0.8)
-    if not ok then
-        log("Download UI fetch failed → Force Main UI fallback")
-        if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
-        return
-    end
-    -- Patch Download UI: บังคับเรียก UFO_ShowMain ก่อน gui:Destroy()
-    do
-        local patched = src
-        local injected = 0
-        patched, injected = patched:gsub(
-            "gui:Destroy%(%);?",
-            [[
-if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
-gui:Destroy();
-]]
-        )
-        if injected > 0 then
-            log("Patched Download UI to always call UFO_ShowMain() on finish.")
-            src = patched
-        else
-            log("No patch point found in Download UI (ok if it calls itself).")
+----------------------------- Sources -------------------------------
+local SRC_URL_KEY      = "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X/refs/heads/main/UFO%20HUB%20X%20key.lua"
+local SRC_URL_DOWNLOAD = "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X-2/refs/heads/main/UFO%20HUB%20X%20Download.lua"
+local SRC_URL_MAINUI   = "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X-3/refs/heads/main/UFO%20HUB%20X%20UI.lua"
+
+-- คอนฟิกเกมแบบไดนามิก (แก้บน Git ได้)
+local GAMES_CFG_URL    = "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X-MAX/refs/heads/main/games.json"
+-- โครงสร้าง games.json (ตัวอย่าง):
+-- {
+--   "Grow a Garden": {
+--     "placeIds": [1234567890, 1234567891],
+--     "features": ["autoPlant","autoWater","autoHarvest","speedBoost","teleportPads"],
+--     "ui": true
+--   }
+-- }
+
+----------------------------- Game Info -----------------------------
+local PLACE_ID = game.PlaceId
+local GAME_NAME = ""
+pcall(function()
+    local info = MPS:GetProductInfo(PLACE_ID)
+    GAME_NAME = info and info.Name or ""
+end)
+
+----------------------------- Game Config ---------------------------
+local GAME_CFG = nil
+do
+    local ok, json = http_get(GAMES_CFG_URL)
+    if ok and json and #json>0 then
+        local ok2, data = pcall(function() return HttpService:JSONDecode(json) end)
+        if ok2 and type(data)=="table" then
+            GAME_CFG = data
         end
     end
-    local ok2, err = safe_loadstring(src, "UFOHubX_Download")
-    if not ok2 then
-        log("Download UI run failed: "..tostring(err))
-        if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
-        return
+end
+
+local function pickGameEntry()
+    if not GAME_CFG then return nil end
+    -- 1) match ด้วย PlaceId
+    for name, entry in pairs(GAME_CFG) do
+        if entry.placeIds and table.find(entry.placeIds, PLACE_ID) then
+            return name, entry
+        end
     end
+    -- 2) สำรองด้วยชื่อเกม (เท่ากันเป๊ะ)
+    for name, entry in pairs(GAME_CFG) do
+        if tostring(name) == tostring(GAME_NAME) then
+            return name, entry
+        end
+    end
+    -- 3) สำรองด้วย contains (กันชื่อเวอร์ชัน)
+    for name, entry in pairs(GAME_CFG) do
+        if tostring(GAME_NAME):lower():find(tostring(name):lower(), 1, true) then
+            return name, entry
+        end
+    end
+    return nil
+end
+
+local GAME_KEY, GAME_ENTRY = pickGameEntry()
+
+----------------------------- Feature Loader ------------------------
+-- จุดรวมโหลดฟีเจอร์ของแต่ละเกม (โครง—ยังไม่ใส่ logic ภายใน)
+-- สมมุติใส่ไว้ใน repo UFO-HUB-X-Features/growagarden/*.lua
+local FEATURES_BASE = "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X-Features/refs/heads/main/growagarden/"
+
+local FEATURE_FILES = {
+    autoPlant     = FEATURES_BASE .. "autoPlant.lua",
+    autoWater     = FEATURES_BASE .. "autoWater.lua",
+    autoHarvest   = FEATURES_BASE .. "autoHarvest.lua",
+    speedBoost    = FEATURES_BASE .. "speedBoost.lua",
+    teleportPads  = FEATURES_BASE .. "teleportPads.lua",
+}
+
+-- API ให้ UI หลักเรียกเปิด/ปิดแต่ละฟีเจอร์
+_G.UFO_Features = _G.UFO_Features or {}
+_G.UFO_Features.__loaded = _G.UFO_Features.__loaded or {} -- cache module
+_G.UFO_Features.start = function(name)
+    local url = FEATURE_FILES[name]
+    if not url then return false, "unknown_feature" end
+    if _G.UFO_Features.__loaded[name] and _G.UFO_Features.__loaded[name].start then
+        local ok,err = pcall(_G.UFO_Features.__loaded[name].start)
+        return ok, err
+    end
+    -- โหลดครั้งแรก
+    local ok, src = http_get(url)
+    if not ok then return false, "get_fail" end
+    local f, err = loadstring(src); if not f then return false, err end
+    local ok2, module = pcall(f); if not ok2 then return false, module end
+    _G.UFO_Features.__loaded[name] = module
+    if module and module.start then
+        local ok3, er3 = pcall(module.start)
+        return ok3, er3
+    end
+    return false, "no_start"
+end
+_G.UFO_Features.stop = function(name)
+    local m = _G.UFO_Features.__loaded[name]
+    if m and m.stop then
+        local ok,err = pcall(m.stop)
+        return ok, err
+    end
+    return false, "not_running"
+end
+
+----------------------------- UI Bridges ----------------------------
+-- ให้ Key/Download/MainUI เรียกต่อ ๆ กัน
+_G.UFO_StartDownload = function()
+    load_from(SRC_URL_DOWNLOAD)
 end
 
 _G.UFO_ShowMain = function()
-    if _G.__UFO_Main_Started then return end
-    _G.__UFO_Main_Started = true
-    log("Show Main UI")
-    local ok, src, used = http_get_retry(URL_MAINS, 5, 0.8)
-    if not ok then
-        log("Main UI fetch failed. Please check your GitHub raw URL.")
-        return
-    end
-    local ok2, err = safe_loadstring(src, "UFOHubX_Main")
-    if not ok2 then
-        log("Main UI run failed: "..tostring(err))
-        return
+    -- ก่อนเปิด UI หลัก: ผูก “รายการฟีเจอร์ของเกมนี้” ให้ UI ใช้ render
+    _G.UFO_CurrentGame = {
+        name     = GAME_KEY or GAME_NAME or "Unknown",
+        placeId  = PLACE_ID,
+        features = (GAME_ENTRY and GAME_ENTRY.features) or {},
+        showUI   = (GAME_ENTRY and GAME_ENTRY.ui) == true
+    }
+    if _G.UFO_CurrentGame.showUI then
+        load_from(SRC_URL_MAINUI)
+    else
+        warn("[UFO] Game config set ui=false; main UI not shown.")
     end
 end
 
---========================================================
--- Watchers / Fallback หลายชั้น
---========================================================
-local function startKeyWatcher(timeout_sec)
-    timeout_sec = timeout_sec or 120
-    task.spawn(function()
-        local t0 = os.clock()
-        while (os.clock() - t0) < timeout_sec do
-            if _G and _G.UFO_HUBX_KEY_OK then
-                log("Watcher: KEY_OK detected → start download")
-                if _G and _G.UFO_StartDownload then _G.UFO_StartDownload() end
-                return
-            end
-            task.wait(0.25)
-        end
-        log("Watcher: Key stage timeout (still waiting for user input).")
-    end)
-end
-
-local function startDownloadWatcher(timeout_sec)
-    timeout_sec = timeout_sec or 90
-    task.spawn(function()
-        local t0 = os.clock()
-        while (os.clock() - t0) < timeout_sec do
-            if _G and _G.__UFO_Main_Started then return end
-            task.wait(0.5)
-        end
-        log("Watcher: Download timeout → Force Main UI")
-        if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
-    end)
-end
-
-local function startUltimateWatchdog(total_sec)
-    -- ถ้าติดค้างรวม ๆ เกินเวลานี้ จะบังคับเปิด Main UI
-    total_sec = total_sec or 180
-    task.spawn(function()
-        local t0 = os.clock()
-        while (os.clock() - t0) < total_sec do
-            if _G and _G.__UFO_Main_Started then return end
-            task.wait(1)
-        end
-        log("Ultimate Watchdog: Forcing Main UI (safety).")
-        if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
-    end)
-end
-
---========================================================
--- Boot Flow
---========================================================
-local cur = readState()
-local valid = isKeyStillValid(cur)
-
-startUltimateWatchdog(180) -- สุดทาง 3 นาที บังคับเปิด Main
-
-if valid then
-    log("Key valid → skip Key UI → go Download")
-    _G.UFO_HUBX_KEY_OK   = true
-    _G.UFO_HUBX_KEY      = cur.key
-    _G.UFO_HUBX_KEY_EXP  = cur.expires_at
-    _G.UFO_HUBX_KEY_PERM = cur.permanent and true or false
-
-    startDownloadWatcher(90)
-    local ok, src = http_get_retry(URL_DOWNLOADS, 5, 0.8)
-    if not ok then
-        log("Download UI fetch failed on skip-key path → Force Main")
-        if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
-        return
-    end
-    -- Patch Download UI ให้ชัวร์
-    do
-        local patched = src
-        local injected = 0
-        patched, injected = patched:gsub(
-            "gui:Destroy%(%);?",
-            [[
-if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
-gui:Destroy();
-]]
-        )
-        if injected > 0 then
-            log("Patched Download UI (skip-key path) to always call UFO_ShowMain().")
-            src = patched
-        end
-    end
-    local ok2, err = safe_loadstring(src, "UFOHubX_Download")
-    if not ok2 then
-        log("Download UI run failed (skip-key path): "..tostring(err))
-        if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
-        return
-    end
-
+----------------------------- Boot Flow -----------------------------
+if not isKeyStillValid() then
+    -- ยังไม่ผ่านคีย์ → แสดง Key UI ก่อน (เมื่อผ่านแล้ว Key UI จะเรียก UFO_StartDownload เอง)
+    load_from(SRC_URL_KEY)
 else
-    log("No valid key → show Key UI")
-    startKeyWatcher(120)      -- จับ KEY_OK
-    startDownloadWatcher(120) -- กันเงียบหลังคีย์ผ่าน
-
-    local ok, src = http_get_retry(URL_KEYS, 5, 0.8)
-    if not ok then
-        log("Key UI fetch failed (cannot continue without Key UI)")
-        return
-    end
-
-    -- Patch Key UI: ให้เรียก UFO_StartDownload() ก่อน gui:Destroy() (หลังยืนยันคีย์)
-    do
-        local patched = src
-        local injected = 0
-        patched, injected = patched:gsub(
-            "gui:Destroy%(%);?",
-            [[
-if _G and _G.UFO_StartDownload then _G.UFO_StartDownload() end
-gui:Destroy();
-]]
-        )
-        -- สำรอง ถ้าไม่เจอ destroy ให้แพตช์หลัง "✅ Key accepted"
-        if injected == 0 then
-            patched, injected = patched:gsub(
-                'btnSubmit.Text%s*=%s*"✅ Key accepted"',
-                [[btnSubmit.Text = "✅ Key accepted"
-if _G and _G.UFO_StartDownload then _G.UFO_StartDownload() end
-]]
-            )
-        end
-        if injected > 0 then
-            log("Patched Key UI to always call UFO_StartDownload() on success.")
-            src = patched
-        else
-            log("No patch point found in Key UI (ok if it calls itself).")
-        end
-    end
-
-    local ok2, err = safe_loadstring(src, "UFOHubX_Key")
-    if not ok2 then
-        log("Key UI run failed: "..tostring(err))
-        return
-    end
+    -- เคยผ่านคีย์แล้วและยังไม่หมดเวลา → ข้ามไป Download
+    _G.UFO_StartDownload()
 end
-
--- Done boot loader
