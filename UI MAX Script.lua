@@ -3,6 +3,7 @@
 -- รองรับ Delta / syn / KRNL / Script-Ware / Fluxus / Solara ฯลฯ + loadstring(HttpGet)
 -- จัดเต็ม: Patch Key/Download ให้ยิงสัญญาณ, Watchers หลายชั้น, Retry/Backoff, Force Main fallback
 -- + เพิ่ม: FORCE_KEY_UI, Hotkey ลบคีย์แล้วรีโหลด (RightAlt), deleteState(), reloadSelf()
+-- + เพิ่ม (ใหม่): Force Key First บังคับให้ Key UI แสดงก่อนเสมอ (ปรับได้ด้วย getgenv().UFO_FORCE_KEY_UI)
 
 --========================================================
 -- Services + Compat
@@ -30,7 +31,6 @@ local function http_get(url)
 end
 
 local function http_get_retry(urls, tries, delay_s)
-    -- urls = string หรือ {string, string2, ...}
     local list = {}
     if type(urls)=="table" then list = urls else list = {urls} end
     tries   = tries or 3
@@ -43,7 +43,7 @@ local function http_get_retry(urls, tries, delay_s)
             local ok, body = http_get(u)
             if ok and body then return true, body, u end
         end
-        task.wait(delay_s * round) -- ค่อย ๆ เพิ่มเวลาเล็กน้อย
+        task.wait(delay_s * round)
     end
     return false, "retry_failed"
 end
@@ -57,7 +57,7 @@ local function safe_loadstring(src, tag)
 end
 
 --========================================================
--- FS: Persist key state (ใช้ได้ถ้ามี isfolder/readfile/writefile)
+-- FS: Persist key state
 --========================================================
 local DIR        = "UFOHubX"
 local STATE_FILE = DIR.."/key_state.json"
@@ -93,7 +93,6 @@ end
 --========================================================
 local URL_KEYS = {
     "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X/refs/heads/main/UFO%20HUB%20X%20key.lua",
-    -- เพิ่ม mirror ได้ที่นี่
 }
 local URL_DOWNLOADS = {
     "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X-2/refs/heads/main/UFO%20HUB%20X%20Download.lua",
@@ -114,7 +113,7 @@ local FORCE_KEY_UI = false
 local ENABLE_CLEAR_HOTKEY = true
 local CLEAR_HOTKEY        = Enum.KeyCode.RightAlt
 
--- [ADD] ต้องตั้งค่าเวลารัน เพื่อให้ reloadSelf ใช้งานได้
+-- [ADD] ใช้กับ reloadSelf (ตั้งค่านี้ตอนเรียก)
 -- getgenv().UFO_BootURL = "https://raw.githubusercontent.com/<YOU>/<REPO>/main/UI%20MAX%20Script.lua"
 
 local function normKey(s)
@@ -145,7 +144,7 @@ local function saveKeyState(key, expires_at, permanent)
 end
 
 --========================================================
--- [ADD] Reload ตัวเอง (ต้องเซ็ต getgenv().UFO_BootURL ก่อนรัน)
+-- Reload ตัวเอง
 --========================================================
 local function reloadSelf()
     local boot = (getgenv and getgenv().UFO_BootURL) or nil
@@ -165,7 +164,7 @@ local function reloadSelf()
 end
 
 --========================================================
--- Global callbacks (ให้ Key/Download/Main UI เรียก)
+-- Global callbacks (Key/Download/Main เรียกใช้)
 --========================================================
 _G.UFO_SaveKeyState = function(key, expires_at, permanent)
     log(("SaveKeyState: key=%s exp=%s perm=%s"):format(tostring(key), tostring(expires_at), tostring(permanent)))
@@ -186,7 +185,6 @@ _G.UFO_StartDownload = function()
         if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
         return
     end
-    -- Patch Download UI: บังคับเรียก UFO_ShowMain ก่อน gui:Destroy()
     do
         local patched = src
         local injected = 0
@@ -261,7 +259,6 @@ local function startDownloadWatcher(timeout_sec)
 end
 
 local function startUltimateWatchdog(total_sec)
-    -- ถ้าติดค้างรวม ๆ เกินเวลานี้ จะบังคับเปิด Main UI
     total_sec = total_sec or 180
     task.spawn(function()
         local t0 = os.clock()
@@ -291,14 +288,24 @@ end
 --========================================================
 -- Boot Flow
 --========================================================
-local cur = readState()
+startUltimateWatchdog(180)
+
+-- [ADD] Force Key First: บังคับให้ Key UI แสดงก่อนเสมอ
+do
+    local env = (getgenv and getgenv().UFO_FORCE_KEY_UI)
+    if env == nil then
+        FORCE_KEY_UI = true     -- ค่าเริ่มต้น: บังคับให้ขึ้น Key UI ก่อนเสมอ
+    else
+        FORCE_KEY_UI = env and true or false  -- ถ้ากำหนดเอง ให้ตามนั้น
+    end
+end
+
+local cur   = readState()
 local valid = isKeyStillValid(cur)
 
-startUltimateWatchdog(180) -- สุดทาง 3 นาที บังคับเปิด Main
-
--- [ADD] บังคับขึ้น Key UI (สำหรับเทสต์)
+-- เสมือนโหมดบังคับ Key UI (จะเข้าบล็อกนี้ก่อน)
 if FORCE_KEY_UI then
-    log("FORCE_KEY_UI = true → show Key UI")
+    log("FORCE_KEY_UI = true → show Key UI (first)")
     startKeyWatcher(120)
     startDownloadWatcher(120)
 
@@ -335,6 +342,7 @@ if _G and _G.UFO_StartDownload then _G.UFO_StartDownload() end
     return
 end
 
+-- (โหมดปกติ ถ้าไม่ force)
 if valid then
     log("Key valid → skip Key UI → go Download")
     _G.UFO_HUBX_KEY_OK   = true
@@ -349,7 +357,6 @@ if valid then
         if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
         return
     end
-    -- Patch Download UI ให้ชัวร์
     do
         local patched = src
         local injected = 0
@@ -371,19 +378,16 @@ gui:Destroy();
         if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
         return
     end
-
 else
     log("No valid key → show Key UI")
-    startKeyWatcher(120)      -- จับ KEY_OK
-    startDownloadWatcher(120) -- กันเงียบหลังคีย์ผ่าน
+    startKeyWatcher(120)
+    startDownloadWatcher(120)
 
     local ok, src = http_get_retry(URL_KEYS, 5, 0.8)
     if not ok then
         log("Key UI fetch failed (cannot continue without Key UI)")
         return
     end
-
-    -- Patch Key UI: ให้เรียก UFO_StartDownload() ก่อน gui:Destroy() (หลังยืนยันคีย์)
     do
         local patched = src
         local injected = 0
@@ -394,7 +398,6 @@ if _G and _G.UFO_StartDownload then _G.UFO_StartDownload() end
 gui:Destroy();
 ]]
         )
-        -- สำรอง ถ้าไม่เจอ destroy ให้แพตช์หลัง "✅ Key accepted"
         if injected == 0 then
             patched, injected = patched:gsub(
                 'btnSubmit.Text%s*=%s*"✅ Key accepted"',
@@ -410,7 +413,6 @@ if _G and _G.UFO_StartDownload then _G.UFO_StartDownload() end
             log("No patch point found in Key UI (ok if it calls itself).")
         end
     end
-
     local ok2, err = safe_loadstring(src, "UFOHubX_Key")
     if not ok2 then
         log("Key UI run failed: "..tostring(err))
