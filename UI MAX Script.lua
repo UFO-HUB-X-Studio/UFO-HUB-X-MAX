@@ -2,11 +2,13 @@
 -- UFO HUB X — Boot Loader (Key → Download → Main UI)
 -- รองรับ Delta / syn / KRNL / Script-Ware / Fluxus / Solara ฯลฯ + loadstring(HttpGet)
 -- จัดเต็ม: Patch Key/Download ให้ยิงสัญญาณ, Watchers หลายชั้น, Retry/Backoff, Force Main fallback
+-- + เพิ่ม: FORCE_KEY_UI, Hotkey ลบคีย์แล้วรีโหลด (RightAlt), deleteState(), reloadSelf()
 
 --========================================================
 -- Services + Compat
 --========================================================
-local HttpService = game:GetService("HttpService")
+local HttpService  = game:GetService("HttpService")
+local UIS          = game:GetService("UserInputService")
 
 local function log(s)
     s = "[UFO-HUB-X] "..tostring(s)
@@ -81,6 +83,11 @@ local function writeState(tbl)
     if ok then pcall(writefile, STATE_FILE, json) end
 end
 
+-- [ADD] ลบไฟล์ state (ใช้ตอนเคลียร์คีย์)
+local function deleteState()
+    if isfile and isfile(STATE_FILE) and delfile then pcall(delfile, STATE_FILE) end
+end
+
 --========================================================
 -- Config
 --========================================================
@@ -99,6 +106,16 @@ local ALLOW_KEYS = {
     ["JJJMAX"]                = { permanent=true,  reusable=true, expires_at=nil },
     ["GMPANUPHONGARTPHAIRIN"] = { permanent=true,  reusable=true, expires_at=nil },
 }
+
+-- [ADD] ตัวเลือกบังคับแสดง Key UI (ไว้เทสต์)
+local FORCE_KEY_UI = false
+
+-- [ADD] Hotkey เคลียร์คีย์ + รีโหลดสคริปต์ (RightAlt)
+local ENABLE_CLEAR_HOTKEY = true
+local CLEAR_HOTKEY        = Enum.KeyCode.RightAlt
+
+-- [ADD] ต้องตั้งค่าเวลารัน เพื่อให้ reloadSelf ใช้งานได้
+-- getgenv().UFO_BootURL = "https://raw.githubusercontent.com/<YOU>/<REPO>/main/UI%20MAX%20Script.lua"
 
 local function normKey(s)
     s = tostring(s or ""):gsub("%c",""):gsub("%s+",""):gsub("[^%w]","")
@@ -125,6 +142,26 @@ local function saveKeyState(key, expires_at, permanent)
         saved_at   = os.time(),
     }
     writeState(st)
+end
+
+--========================================================
+-- [ADD] Reload ตัวเอง (ต้องเซ็ต getgenv().UFO_BootURL ก่อนรัน)
+--========================================================
+local function reloadSelf()
+    local boot = (getgenv and getgenv().UFO_BootURL) or nil
+    if boot and #boot > 0 then
+        task.delay(0.15, function()
+            local ok, src = http_get(boot)
+            if ok then
+                local f = loadstring(src)
+                if f then pcall(f) end
+            else
+                log("reloadSelf: fetch failed, check UFO_BootURL")
+            end
+        end)
+    else
+        log("reloadSelf: getgenv().UFO_BootURL not set.")
+    end
 end
 
 --========================================================
@@ -238,12 +275,65 @@ local function startUltimateWatchdog(total_sec)
 end
 
 --========================================================
+-- [ADD] Hotkey เคลียร์คีย์ + รีโหลด
+--========================================================
+if ENABLE_CLEAR_HOTKEY then
+    UIS.InputBegan:Connect(function(i, gpe)
+        if gpe then return end
+        if i.KeyCode == CLEAR_HOTKEY then
+            log("Hotkey: clear key state and reload")
+            deleteState()
+            reloadSelf()
+        end
+    end)
+end
+
+--========================================================
 -- Boot Flow
 --========================================================
 local cur = readState()
 local valid = isKeyStillValid(cur)
 
 startUltimateWatchdog(180) -- สุดทาง 3 นาที บังคับเปิด Main
+
+-- [ADD] บังคับขึ้น Key UI (สำหรับเทสต์)
+if FORCE_KEY_UI then
+    log("FORCE_KEY_UI = true → show Key UI")
+    startKeyWatcher(120)
+    startDownloadWatcher(120)
+
+    local ok, src = http_get_retry(URL_KEYS, 5, 0.8)
+    if not ok then
+        log("Key UI fetch failed (cannot continue without Key UI)")
+        return
+    end
+    do
+        local patched = src
+        local injected = 0
+        patched, injected = patched:gsub(
+            "gui:Destroy%(%);?",
+            [[
+if _G and _G.UFO_StartDownload then _G.UFO_StartDownload() end
+gui:Destroy();
+]]
+        )
+        if injected == 0 then
+            patched, injected = patched:gsub(
+                'btnSubmit.Text%s*=%s*"✅ Key accepted"',
+                [[btnSubmit.Text = "✅ Key accepted"
+if _G and _G.UFO_StartDownload then _G.UFO_StartDownload() end
+]]
+            )
+        end
+        if injected > 0 then
+            log("Patched Key UI to always call UFO_StartDownload() on success.")
+            src = patched
+        end
+    end
+    local ok2, err = safe_loadstring(src, "UFOHubX_Key")
+    if not ok2 then log("Key UI run failed: "..tostring(err)) end
+    return
+end
 
 if valid then
     log("Key valid → skip Key UI → go Download")
