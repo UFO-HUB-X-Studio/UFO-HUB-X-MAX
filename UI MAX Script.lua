@@ -1,10 +1,8 @@
 -- UI MAX Script.lua
 -- UFO HUB X — Boot Loader (Key → Download → Main UI)
 -- รองรับ Delta / syn / KRNL / Script-Ware / Fluxus / Solara ฯลฯ + loadstring(HttpGet)
--- จัดเต็ม: Patch Key/Download ให้ยิงสัญญาณ, Watchers หลายชั้น, Retry/Backoff, Force Main fallback
--- + เพิ่ม: FORCE_KEY_UI, Hotkey ลบคีย์แล้วรีโหลด (RightAlt), deleteState(), reloadSelf()
--- + เพิ่ม (ใหม่): Force Key First บังคับให้ Key UI แสดงก่อนเสมอ (ปรับได้ด้วย getgenv().UFO_FORCE_KEY_UI)
--- + FIX: กดปุ่ม X ใน Key UI จะไม่ไปหน้า Download อีกต่อไป (เรียก Download เฉพาะตอนคีย์ผ่าน)
+-- ฟีเจอร์: Patch Key/Download, Watchers, Retry/Backoff, Force Main fallback,
+-- Hotkey ลบคีย์ (RightAlt), FORCE_KEY_UI (ค่าเริ่มต้นปิด), ป้องกันกด X แล้วข้ามไป Download
 
 --========================================================
 -- Services + Compat
@@ -84,13 +82,12 @@ local function writeState(tbl)
     if ok then pcall(writefile, STATE_FILE, json) end
 end
 
--- ลบไฟล์ state (ใช้ตอนเคลียร์คีย์)
 local function deleteState()
     if isfile and isfile(STATE_FILE) and delfile then pcall(delfile, STATE_FILE) end
 end
 
 --========================================================
--- Config
+-- Config (แก้ URL ให้ตรง repo/ไฟล์ของคุณ)
 --========================================================
 local URL_KEYS = {
     "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X/refs/heads/main/UFO%20HUB%20X%20key.lua",
@@ -107,14 +104,10 @@ local ALLOW_KEYS = {
     ["GMPANUPHONGARTPHAIRIN"] = { permanent=true,  reusable=true, expires_at=nil },
 }
 
--- ตัวเลือกบังคับแสดง Key UI (ไว้เทสต์)
-local FORCE_KEY_UI = false
-
--- Hotkey เคลียร์คีย์ + รีโหลดสคริปต์ (RightAlt)
+local FORCE_KEY_UI = false            -- ค่าเริ่มต้น “ปิด” เพื่อไม่ให้ขึ้น Key UI ซ้ำ
 local ENABLE_CLEAR_HOTKEY = true
 local CLEAR_HOTKEY        = Enum.KeyCode.RightAlt
 
--- ใช้กับ reloadSelf (ตั้งค่านี้ตอนเรียก)
 -- getgenv().UFO_BootURL = "https://raw.githubusercontent.com/<YOU>/<REPO>/main/UI%20MAX%20Script.lua"
 
 local function normKey(s)
@@ -180,13 +173,13 @@ _G.UFO_StartDownload = function()
     if _G.__UFO_Download_Started then return end
     _G.__UFO_Download_Started = true
     log("Start Download UI (signal)")
-    local ok, src, used = http_get_retry(URL_DOWNLOADS, 5, 0.8)
+    local ok, src = http_get_retry(URL_DOWNLOADS, 5, 0.8)
     if not ok then
         log("Download UI fetch failed → Force Main UI fallback")
         if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
         return
     end
-    -- Patch Download UI: เรียก UFO_ShowMain ตอนจบเสมอ
+    -- ให้แน่ใจว่าตอนจบจะไป Main เสมอ
     do
         local patched = src
         local injected = 0
@@ -200,8 +193,6 @@ gui:Destroy();
         if injected > 0 then
             log("Patched Download UI to always call UFO_ShowMain() on finish.")
             src = patched
-        else
-            log("No patch point found in Download UI (ok if it calls itself).")
         end
     end
     local ok2, err = safe_loadstring(src, "UFOHubX_Download")
@@ -216,7 +207,7 @@ _G.UFO_ShowMain = function()
     if _G.__UFO_Main_Started then return end
     _G.__UFO_Main_Started = true
     log("Show Main UI")
-    local ok, src, used = http_get_retry(URL_MAINS, 5, 0.8)
+    local ok, src = http_get_retry(URL_MAINS, 5, 0.8)
     if not ok then
         log("Main UI fetch failed. Please check your GitHub raw URL.")
         return
@@ -292,11 +283,11 @@ end
 --========================================================
 startUltimateWatchdog(180)
 
--- Force Key First (บังคับ Key UI ก่อนเสมอถ้าไม่ตั้งค่าเอง)
+-- Force Key First (ค่าเริ่มต้น = ปิด, ใครอยากบังคับให้ set: getgenv().UFO_FORCE_KEY_UI=true ก่อนรัน)
 do
     local env = (getgenv and getgenv().UFO_FORCE_KEY_UI)
     if env == nil then
-        FORCE_KEY_UI = true
+        FORCE_KEY_UI = false   -- *** จุดแก้หลัก: ปิดค่าเริ่มต้น ***
     else
         FORCE_KEY_UI = env and true or false
     end
@@ -319,7 +310,7 @@ if FORCE_KEY_UI then
     do
         local patched = src
         local injected = 0
-        -- FIX: เรียก Download เฉพาะเมื่อ KEY_OK จริง
+        -- เรียก Download เฉพาะเมื่อ KEY_OK แล้วเท่านั้น
         patched, injected = patched:gsub(
             "gui:Destroy%(%);?",
             [[
@@ -328,7 +319,6 @@ gui:Destroy();
 ]]
         )
         if injected == 0 then
-            -- สำรอง: inject หลังข้อความ "✅ Key accepted"
             patched, injected = patched:gsub(
                 'btnSubmit.Text%s*=%s*"✅ Key accepted"',
                 [[btnSubmit.Text = "✅ Key accepted"
@@ -339,8 +329,6 @@ if _G and _G.UFO_StartDownload then _G.UFO_StartDownload() end
         if injected > 0 then
             log("Patched Key UI to call UFO_StartDownload() only when key is OK.")
             src = patched
-        else
-            log("No patch point found in Key UI (ok if it calls itself).")
         end
     end
     local ok2, err = safe_loadstring(src, "UFOHubX_Key")
@@ -397,7 +385,6 @@ else
     do
         local patched = src
         local injected = 0
-        -- FIX: เรียก Download เฉพาะเมื่อ KEY_OK จริง
         patched, injected = patched:gsub(
             "gui:Destroy%(%);?",
             [[
@@ -416,8 +403,6 @@ if _G and _G.UFO_StartDownload then _G.UFO_StartDownload() end
         if injected > 0 then
             log("Patched Key UI to call UFO_StartDownload() only when key is OK.")
             src = patched
-        else
-            log("No patch point found in Key UI (ok if it calls itself).")
         end
     end
     local ok2, err = safe_loadstring(src, "UFOHubX_Key")
