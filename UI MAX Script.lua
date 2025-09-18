@@ -1,471 +1,430 @@
---!strict
--- Roblox Studio Plugin: UFO HUB X (Dev Tool) - Safe Version
--- • ใช้ใน Roblox Studio เท่านั้น เพื่ออำนวยความสะดวก dev
--- • ไม่มีการใช้ executor APIs / ไม่มีการหลบระบบความปลอดภัยของแพลตฟอร์ม
--- • โฟกัสโครงสร้างที่ดี: namespace, feature flags, retry/backoff, state, watcher
+-- UI MAX Script.lua
+-- UFO HUB X — Boot Loader (Key → Download → Main UI)
+-- รองรับ Delta / syn / KRNL / Script-Ware / Fluxus / Solara ฯลฯ + loadstring(HttpGet)
+-- จัดเต็ม: Patch Key/Download ให้ยิงสัญญาณ, Watchers หลายชั้น, Retry/Backoff, Force Main fallback
+-- + เพิ่ม: FORCE_KEY_UI, Hotkey ลบคีย์แล้วรีโหลด (RightAlt), deleteState(), reloadSelf()
+-- + เพิ่ม (ใหม่): Force Key First บังคับให้ Key UI แสดงก่อนเสมอ (ปรับได้ด้วย getgenv().UFO_FORCE_KEY_UI)
+-- + FIX: กดปุ่ม X ใน Key UI จะไม่ไปหน้า Download อีกต่อไป (เรียก Download เฉพาะตอนคีย์ผ่าน)
 
-----------------------------
--- Services
-----------------------------
-local Toolbar = plugin:CreateToolbar("UFO HUB X (Dev)")
-local HttpService = game:GetService("HttpService")
+--========================================================
+-- Services + Compat
+--========================================================
+local HttpService  = game:GetService("HttpService")
+local UIS          = game:GetService("UserInputService")
 
-----------------------------
--- Namespace & Config
-----------------------------
-local UFO = {
-    cfg = {},
-    state = {
-        keyOk = false,
-        mainStarted = false,
-        downloadStarted = false,
-        keyData = nil, -- {key=..., expires_at=..., permanent=...}
-    },
-}
-
-local CFG = {
-    VERSION = "studio-boot-1.1.0",
-    FEATURES = {
-        FORCE_KEY_UI_DEFAULT = true,
-        TRUST_EXTERNAL_KEY = true, -- ถ้า false จะตรวจกับ ALLOW_KEYS
-        ENABLE_CLEAR_BUTTON = true,
-        DOWNLOAD_TIMEOUT_SEC = 90,
-        KEY_TIMEOUT_SEC = 120,
-        WATCHDOG_TOTAL_SEC = 180,
-    },
-    -- ปรับลิงก์ของคุณเอง (ควบคุมได้ และสอดคล้องกฎ Roblox/ทีมคุณ)
-    URL_KEYS = {
-        "https://example.com/dev/key-ui.lua",
-    },
-    URL_DOWNLOADS = {
-        "https://example.com/dev/download-ui.lua",
-    },
-    URL_MAINS = {
-        "https://example.com/dev/main-ui.lua",
-    },
-    -- allow-list ภายในสำหรับงาน dev (ถ้า TRUST_EXTERNAL_KEY=false จะใช้ตรงนี้)
-    ALLOW_KEYS = {
-        ["JJJMAX"] = { permanent=true,  reusable=true, expires_at=nil },
-        ["GMPANUPHONGARTPHAIRIN"] = { permanent=true,  reusable=true, expires_at=nil },
-    },
-}
-
-local SETTINGS_KEY = "UFO_HUBX_STATE_V1"
-
-local function log(msg: string)
-    print(("[UFO-HUB-X/Studio] %s"):format(msg))
+local function log(s)
+    s = "[UFO-HUB-X] "..tostring(s)
+    if rconsoleprint then rconsoleprint(s.."\n") else print(s) end
 end
 
-----------------------------
--- Utils
-----------------------------
-local function normKey(s: string?): string
-    s = tostring(s or ""):gsub("%c",""):gsub("%s+",""):gsub("[^%w]","")
-    return string.upper(s)
-end
-
-local function encodeJSON(tbl)
-    return HttpService:JSONEncode(tbl)
-end
-
-local function decodeJSON(s)
-    return HttpService:JSONDecode(s)
-end
-
-local function readState()
-    local raw = plugin:GetSetting(SETTINGS_KEY)
-    if typeof(raw) == "string" and #raw > 0 then
-        local ok, data = pcall(decodeJSON, raw)
-        if ok and data then return data end
+local function http_get(url)
+    if http and http.request then
+        local ok, res = pcall(http.request, {Url=url, Method="GET"})
+        if ok and res and (res.Body or res.body) then return true, (res.Body or res.body) end
     end
-    return nil
-end
-
-local function writeState(tbl)
-    local ok, json = pcall(encodeJSON, tbl)
-    if ok then
-        plugin:SetSetting(SETTINGS_KEY, json)
+    if syn and syn.request then
+        local ok, res = pcall(syn.request, {Url=url, Method="GET"})
+        if ok and res and (res.Body or res.body) then return true, (res.Body or res.body) end
     end
+    local ok, body = pcall(function() return game:HttpGet(url) end)
+    if ok and body then return true, body end
+    return false, "httpget_failed"
 end
 
-local function deleteState()
-    plugin:SetSetting(SETTINGS_KEY, "")
-end
-
-local function isKeyStillValid(stateTbl)
-    if not stateTbl or not stateTbl.key then return false end
-    if stateTbl.permanent == true then return true end
-    if stateTbl.expires_at and typeof(stateTbl.expires_at) == "number" then
-        if os.time() < stateTbl.expires_at then return true end
-    end
-    return false
-end
-
-local function checkKeyAllowed(k: string)
-    local nk = normKey(k)
-    local meta = CFG.ALLOW_KEYS[nk]
-    if not meta then return false, "key_not_allowed" end
-    return true, meta
-end
-
-local function saveKeyState(key: string, expires_at: number?, permanent: boolean?)
-    local st = {
-        schema_version = 1,
-        key        = key,
-        permanent  = permanent and true or false,
-        expires_at = expires_at or nil,
-        saved_at   = os.time(),
-    }
-    writeState(st)
-    UFO.state.keyData = st
-end
-
-local function http_get(url: string): (boolean, string?)
-    -- ใช้ HttpService ของ Studio (ไม่ใช่ executor)
-    local ok, body = pcall(function()
-        return HttpService:GetAsync(url, true)
-    end)
-    if ok and typeof(body) == "string" and #body:gsub("%s+","") > 0 then
-        return true, body
-    end
-    return false, nil
-end
-
-local function http_get_retry(urls: {string}, tries: number?, delay_s: number?)
-    local list = urls or {}
+local function http_get_retry(urls, tries, delay_s)
+    local list = {}
+    if type(urls)=="table" then list = urls else list = {urls} end
     tries   = tries or 3
     delay_s = delay_s or 0.75
     local attempt = 0
-    for r=1, tries do
+    for round=1, tries do
         for _,u in ipairs(list) do
             attempt += 1
             log(("HTTP try #%d → %s"):format(attempt, u))
             local ok, body = http_get(u)
             if ok and body then return true, body, u end
         end
-        task.wait(delay_s * r)
+        task.wait(delay_s * round)
     end
-    return false, nil, nil
+    return false, "retry_failed"
 end
 
-local function safe_loadstring(src: string, tag: string?): (boolean, string?)
+local function safe_loadstring(src, tag)
     local f, e = loadstring(src, tag or "chunk")
     if not f then return false, "loadstring: "..tostring(e) end
     local ok, err = pcall(f)
     if not ok then return false, "pcall: "..tostring(err) end
-    return true, nil
+    return true
 end
 
-local function untilOrTimeout(checkFn, timeout, sleep)
-    local t0 = os.clock()
-    timeout = timeout or 60
-    sleep = sleep or 0.25
-    while (os.clock() - t0) < timeout do
-        if checkFn() then return true end
-        task.wait(sleep)
+--========================================================
+-- FS: Persist key state
+--========================================================
+local DIR        = "UFOHubX"
+local STATE_FILE = DIR.."/key_state.json"
+local function ensureDir()
+    if isfolder then
+        if not isfolder(DIR) then pcall(makefolder, DIR) end
+    end
+end
+ensureDir()
+
+local function readState()
+    if not (isfile and readfile and isfile(STATE_FILE)) then return nil end
+    local ok, data = pcall(readfile, STATE_FILE)
+    if not ok or not data or #data==0 then return nil end
+    local ok2, decoded = pcall(function() return HttpService:JSONDecode(data) end)
+    if ok2 then return decoded end
+    return nil
+end
+
+local function writeState(tbl)
+    if not (writefile and HttpService and tbl) then return end
+    local ok, json = pcall(function() return HttpService:JSONEncode(tbl) end)
+    if ok then pcall(writefile, STATE_FILE, json) end
+end
+
+-- ลบไฟล์ state (ใช้ตอนเคลียร์คีย์)
+local function deleteState()
+    if isfile and isfile(STATE_FILE) and delfile then pcall(delfile, STATE_FILE) end
+end
+
+--========================================================
+-- Config
+--========================================================
+local URL_KEYS = {
+    "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X/refs/heads/main/UFO%20HUB%20X%20key.lua",
+}
+local URL_DOWNLOADS = {
+    "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X-2/refs/heads/main/UFO%20HUB%20X%20Download.lua",
+}
+local URL_MAINS = {
+    "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X-3/refs/heads/main/UFO%20HUB%20X%20UI.lua",
+}
+
+local ALLOW_KEYS = {
+    ["JJJMAX"]                = { permanent=true,  reusable=true, expires_at=nil },
+    ["GMPANUPHONGARTPHAIRIN"] = { permanent=true,  reusable=true, expires_at=nil },
+}
+
+-- ตัวเลือกบังคับแสดง Key UI (ไว้เทสต์)
+local FORCE_KEY_UI = false
+
+-- Hotkey เคลียร์คีย์ + รีโหลดสคริปต์ (RightAlt)
+local ENABLE_CLEAR_HOTKEY = true
+local CLEAR_HOTKEY        = Enum.KeyCode.RightAlt
+
+-- ใช้กับ reloadSelf (ตั้งค่านี้ตอนเรียก)
+-- getgenv().UFO_BootURL = "https://raw.githubusercontent.com/<YOU>/<REPO>/main/UI%20MAX%20Script.lua"
+
+local function normKey(s)
+    s = tostring(s or ""):gsub("%c",""):gsub("%s+",""):gsub("[^%w]","")
+    return string.upper(s)
+end
+
+--========================================================
+-- Key state helpers
+--========================================================
+local function isKeyStillValid(state)
+    if not state or not state.key then return false end
+    if state.permanent == true then return true end
+    if state.expires_at and typeof(state.expires_at)=="number" then
+        if os.time() < state.expires_at then return true end
     end
     return false
 end
 
-----------------------------
--- UI (DockWidget)
-----------------------------
-local toolbarButton = Toolbar:CreateButton("UFO_HUB_X_Open", "Open UFO HUB X (Dev)", "")
-
-local info = DockWidgetPluginGuiInfo.new(
-    Enum.InitialDockState.Left,
-    true,   -- initial enabled
-    true,   -- override previous enable
-    350,    -- default width
-    420,    -- default height
-    300,    -- min width
-    360     -- min height
-)
-local dock = plugin:CreateDockWidgetPluginGui("UFO_HUB_X_DEV", info)
-dock.Title = "UFO HUB X (Dev)"
-
-local Screen = Instance.new("Frame")
-Screen.Size = UDim2.fromScale(1,1)
-Screen.BackgroundColor3 = Color3.fromRGB(24,24,28)
-Screen.Parent = dock
-
-local Padding = Instance.new("UIPadding")
-Padding.PaddingTop = UDim.new(0, 10)
-Padding.PaddingLeft = UDim.new(0, 10)
-Padding.PaddingRight = UDim.new(0, 10)
-Padding.PaddingBottom = UDim.new(0, 10)
-Padding.Parent = Screen
-
-local List = Instance.new("UIListLayout")
-List.Padding = UDim.new(0, 8)
-List.FillDirection = Enum.FillDirection.Vertical
-List.SortOrder = Enum.SortOrder.LayoutOrder
-List.Parent = Screen
-
-local function mkLabel(text: string, bold: boolean?)
-    local l = Instance.new("TextLabel")
-    l.Size = UDim2.new(1,0,0,26)
-    l.BackgroundTransparency = 1
-    l.Text = text
-    l.TextXAlignment = Enum.TextXAlignment.Left
-    l.TextColor3 = Color3.fromRGB(230,230,235)
-    l.Font = Enum.Font.Gotham
-    l.TextSize = bold and 18 or 14
-    l.Parent = Screen
-    return l
+local function saveKeyState(key, expires_at, permanent)
+    local st = {
+        key        = key,
+        permanent  = permanent and true or false,
+        expires_at = expires_at or nil,
+        saved_at   = os.time(),
+    }
+    writeState(st)
 end
 
-local function mkButton(text: string, cb)
-    local b = Instance.new("TextButton")
-    b.Size = UDim2.new(1,0,0,36)
-    b.BackgroundColor3 = Color3.fromRGB(40,40,46)
-    b.TextColor3 = Color3.fromRGB(240,240,245)
-    b.Font = Enum.Font.GothamMedium
-    b.TextSize = 14
-    b.Text = text
-    b.AutoButtonColor = true
-    b.MouseButton1Click:Connect(function()
-        pcall(cb)
-    end)
-    b.Parent = Screen
-    return b
-end
-
-local function mkTextBox(placeholder: string)
-    local t = Instance.new("TextBox")
-    t.Size = UDim2.new(1,0,0,34)
-    t.BackgroundColor3 = Color3.fromRGB(35,35,40)
-    t.PlaceholderText = placeholder
-    t.Text = ""
-    t.TextColor3 = Color3.fromRGB(240,240,245)
-    t.PlaceholderColor3 = Color3.fromRGB(150,150,160)
-    t.Font = Enum.Font.Gotham
-    t.TextSize = 14
-    t.ClearTextOnFocus = false
-    t.Parent = Screen
-    return t
-end
-
-mkLabel("UFO HUB X — Dev Loader (Studio Plugin)", true)
-mkLabel("Version: "..CFG.VERSION)
-local keyBox = mkTextBox("Enter dev key (internal)")
-local statusLabel = mkLabel("Status: Idle")
-
-local btnRow = Instance.new("Frame")
-btnRow.Size = UDim2.new(1,0,0,36)
-btnRow.BackgroundTransparency = 1
-btnRow.Parent = Screen
-
-local uiListRow = Instance.new("UIListLayout")
-uiListRow.FillDirection = Enum.FillDirection.Horizontal
-uiListRow.Padding = UDim.new(0,8)
-uiListRow.Parent = btnRow
-
-local btnCheck = mkButton("1) Validate Key", function() end)
-btnCheck.Parent = btnRow
-
-local btnDownload = mkButton("2) Download UI", function() end)
-btnDownload.Parent = btnRow
-
-local btnMain = mkButton("3) Show Main", function() end)
-btnMain.Parent = btnRow
-
-local btnClear
-if CFG.FEATURES.ENABLE_CLEAR_BUTTON then
-    btnClear = mkButton("Clear State", function()
-        deleteState()
-        UFO.state.keyOk = false
-        UFO.state.keyData = nil
-        statusLabel.Text = "Status: Cleared state."
-    end)
-end
-
-----------------------------
--- Callbacks / Flow (Safe)
-----------------------------
-local function onKeyAccepted()
-    statusLabel.Text = "Status: ✅ Key accepted."
-    UFO.state.keyOk = true
-end
-
-local function startDownload()
-    if UFO.state.downloadStarted then return end
-    UFO.state.downloadStarted = true
-    statusLabel.Text = "Status: Downloading..."
-    local ok, src = http_get_retry(CFG.URL_DOWNLOADS, 5, 0.8)
-    if not ok or not src then
-        statusLabel.Text = "Status: Download failed → fallback to Main."
-        task.defer(function()
-            pcall(function()
-                showMain()
-            end)
-        end)
-        return
-    end
-
-    -- bootstrap hook แทนการ gsub fragile
-    local wrapper = string.format([[
-        local _ufo_done = false
-        rawset(_G, "UFO_OnDone", function()
-            _ufo_done = true
-            if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
-        end)
-        %s
-        task.delay(10, function()
-            if not _ufo_done and _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
-        end)
-    ]], src)
-
-    local ok2, err = safe_loadstring(wrapper, "UFO_Studio_Download")
-    if not ok2 then
-        statusLabel.Text = "Status: Download UI error → fallback Main."
-        task.defer(function()
-            pcall(function()
-                showMain()
-            end)
-        end)
-        return
-    end
-    statusLabel.Text = "Status: Download UI loaded."
-end
-
-function showMain()
-    if UFO.state.mainStarted then return end
-    UFO.state.mainStarted = true
-    statusLabel.Text = "Status: Loading Main..."
-    local ok, src = http_get_retry(CFG.URL_MAINS, 5, 0.8)
-    if not ok or not src then
-        statusLabel.Text = "Status: Main load failed. Check URL."
-        return
-    end
-    local ok2, err = safe_loadstring(src, "UFO_Studio_Main")
-    if not ok2 then
-        statusLabel.Text = "Status: Main error. "..tostring(err)
-        return
-    end
-    statusLabel.Text = "Status: Main shown."
-end
-
-_G.UFO_ShowMain = showMain
-
-_G.UFO_SaveKeyState = function(key, expires_at, permanent)
-    if not CFG.FEATURES.TRUST_EXTERNAL_KEY then
-        local ok, meta = checkKeyAllowed(key)
-        if not ok then
-            statusLabel.Text = "Status: ❌ Key rejected (allow-list)."
-            return
-        end
-        if meta.permanent then permanent = true end
-        expires_at = expires_at or meta.expires_at
-    end
-    saveKeyState(key, expires_at, permanent)
-    onKeyAccepted()
-end
-
-local function showKeyUIFirst()
-    statusLabel.Text = "Status: Loading Key UI..."
-    local ok, src = http_get_retry(CFG.URL_KEYS, 5, 0.8)
-    if not ok or not src then
-        statusLabel.Text = "Status: ❌ Key UI fetch failed."
-        return
-    end
-
-    -- Hook ให้ UI เรียก UFO_OnKeyAccepted() (หรืออย่างน้อยเรียก UFO_SaveKeyState)
-    local wrapper = string.format([[
-        rawset(_G, "UFO_OnKeyAccepted", function()
-            if _G and _G.UFO_SaveKeyState then
-                -- ถ้า UI ไม่ส่ง key มา ก็ดึงจากกล่องข้อความของปลั๊กอินนี้แทน (dev only)
-                _G.UFO_SaveKeyState("%s", nil, true)
+--========================================================
+-- Reload ตัวเอง
+--========================================================
+local function reloadSelf()
+    local boot = (getgenv and getgenv().UFO_BootURL) or nil
+    if boot and #boot > 0 then
+        task.delay(0.15, function()
+            local ok, src = http_get(boot)
+            if ok then
+                local f = loadstring(src)
+                if f then pcall(f) end
+            else
+                log("reloadSelf: fetch failed, check UFO_BootURL")
             end
         end)
-        %s
-        -- Fallback: ถ้า UI ไม่เรียก ให้ dev กด Validate เพื่อยืนยันได้
-    ]], normKey(keyBox.Text), src)
+    else
+        log("reloadSelf: getgenv().UFO_BootURL not set.")
+    end
+end
 
-    local ok2, err = safe_loadstring(wrapper, "UFO_Studio_KeyUI")
-    if not ok2 then
-        statusLabel.Text = "Status: Key UI error. "..tostring(err)
+--========================================================
+-- Global callbacks (Key/Download/Main เรียกใช้)
+--========================================================
+_G.UFO_SaveKeyState = function(key, expires_at, permanent)
+    log(("SaveKeyState: key=%s exp=%s perm=%s"):format(tostring(key), tostring(expires_at), tostring(permanent)))
+    saveKeyState(key, expires_at, permanent)
+    _G.UFO_HUBX_KEY_OK   = true
+    _G.UFO_HUBX_KEY      = key
+    _G.UFO_HUBX_KEY_EXP  = expires_at
+    _G.UFO_HUBX_KEY_PERM = permanent and true or false
+end
+
+_G.UFO_StartDownload = function()
+    if _G.__UFO_Download_Started then return end
+    _G.__UFO_Download_Started = true
+    log("Start Download UI (signal)")
+    local ok, src, used = http_get_retry(URL_DOWNLOADS, 5, 0.8)
+    if not ok then
+        log("Download UI fetch failed → Force Main UI fallback")
+        if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
         return
     end
+    -- Patch Download UI: เรียก UFO_ShowMain ตอนจบเสมอ
+    do
+        local patched = src
+        local injected = 0
+        patched, injected = patched:gsub(
+            "gui:Destroy%(%);?",
+            [[
+if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
+gui:Destroy();
+]]
+        )
+        if injected > 0 then
+            log("Patched Download UI to always call UFO_ShowMain() on finish.")
+            src = patched
+        else
+            log("No patch point found in Download UI (ok if it calls itself).")
+        end
+    end
+    local ok2, err = safe_loadstring(src, "UFOHubX_Download")
+    if not ok2 then
+        log("Download UI run failed: "..tostring(err))
+        if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
+        return
+    end
+end
 
-    -- Watcher: ถ้าได้ key แล้วให้กดโหลดต่อได้
+_G.UFO_ShowMain = function()
+    if _G.__UFO_Main_Started then return end
+    _G.__UFO_Main_Started = true
+    log("Show Main UI")
+    local ok, src, used = http_get_retry(URL_MAINS, 5, 0.8)
+    if not ok then
+        log("Main UI fetch failed. Please check your GitHub raw URL.")
+        return
+    end
+    local ok2, err = safe_loadstring(src, "UFOHubX_Main")
+    if not ok2 then
+        log("Main UI run failed: "..tostring(err))
+        return
+    end
+end
+
+--========================================================
+-- Watchers / Fallback หลายชั้น
+--========================================================
+local function startKeyWatcher(timeout_sec)
+    timeout_sec = timeout_sec or 120
     task.spawn(function()
-        local okW = untilOrTimeout(function()
-            return UFO.state.keyOk
-        end, CFG.FEATURES.KEY_TIMEOUT_SEC, 0.25)
-        if not okW then
-            log("Key stage timeout (waiting for user).")
+        local t0 = os.clock()
+        while (os.clock() - t0) < timeout_sec do
+            if _G and _G.UFO_HUBX_KEY_OK then
+                log("Watcher: KEY_OK detected → start download")
+                if _G and _G.UFO_StartDownload then _G.UFO_StartDownload() end
+                return
+            end
+            task.wait(0.25)
+        end
+        log("Watcher: Key stage timeout (still waiting for user input).")
+    end)
+end
+
+local function startDownloadWatcher(timeout_sec)
+    timeout_sec = timeout_sec or 90
+    task.spawn(function()
+        local t0 = os.clock()
+        while (os.clock() - t0) < timeout_sec do
+            if _G and _G.__UFO_Main_Started then return end
+            task.wait(0.5)
+        end
+        log("Watcher: Download timeout → Force Main UI")
+        if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
+    end)
+end
+
+local function startUltimateWatchdog(total_sec)
+    total_sec = total_sec or 180
+    task.spawn(function()
+        local t0 = os.clock()
+        while (os.clock() - t0) < total_sec do
+            if _G and _G.__UFO_Main_Started then return end
+            task.wait(1)
+        end
+        log("Ultimate Watchdog: Forcing Main UI (safety).")
+        if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
+    end)
+end
+
+--========================================================
+-- Hotkey เคลียร์คีย์ + รีโหลด
+--========================================================
+if ENABLE_CLEAR_HOTKEY then
+    UIS.InputBegan:Connect(function(i, gpe)
+        if gpe then return end
+        if i.KeyCode == CLEAR_HOTKEY then
+            log("Hotkey: clear key state and reload")
+            deleteState()
+            reloadSelf()
         end
     end)
 end
 
-----------------------------
--- Wire Buttons
-----------------------------
-btnCheck.MouseButton1Click:Connect(function()
-    local key = normKey(keyBox.Text)
-    if key == "" then
-        statusLabel.Text = "Status: Please enter key (dev)."
-        return
-    end
-    if not CFG.FEATURES.TRUST_EXTERNAL_KEY then
-        local ok, meta = checkKeyAllowed(key)
-        if not ok then
-            statusLabel.Text = "Status: ❌ Key not allowed (dev)."
-            return
-        end
-        saveKeyState(key, meta.expires_at, meta.permanent)
+--========================================================
+-- Boot Flow
+--========================================================
+startUltimateWatchdog(180)
+
+-- Force Key First (บังคับ Key UI ก่อนเสมอถ้าไม่ตั้งค่าเอง)
+do
+    local env = (getgenv and getgenv().UFO_FORCE_KEY_UI)
+    if env == nil then
+        FORCE_KEY_UI = true
     else
-        saveKeyState(key, nil, true)
-    end
-    onKeyAccepted()
-end)
-
-btnDownload.MouseButton1Click:Connect(function()
-    if not UFO.state.keyOk then
-        statusLabel.Text = "Status: Enter/Validate key first."
-        return
-    end
-    startDownload()
-end)
-
-btnMain.MouseButton1Click:Connect(function()
-    showMain()
-end)
-
-toolbarButton.Click:Connect(function()
-    dock.Enabled = not dock.Enabled
-end)
-
-----------------------------
--- Boot
-----------------------------
-log("Booting "..CFG.VERSION)
-statusLabel.Text = "Status: Booting "..CFG.VERSION
-
-local cur = readState()
-local valid = isKeyStillValid(cur)
-if valid then
-    UFO.state.keyOk = true
-    UFO.state.keyData = cur
-    statusLabel.Text = "Status: Key OK (from state)."
-else
-    if CFG.FEATURES.FORCE_KEY_UI_DEFAULT then
-        showKeyUIFirst()
-    else
-        statusLabel.Text = "Status: Waiting. Enter key or open Key UI."
+        FORCE_KEY_UI = env and true or false
     end
 end
 
--- Watchdog (รวม)
-task.spawn(function()
-    local t0 = os.clock()
-    while (os.clock() - t0) < CFG.FEATURES.WATCHDOG_TOTAL_SEC do
-        if UFO.state.mainStarted then return end
-        task.wait(1)
+local cur   = readState()
+local valid = isKeyStillValid(cur)
+
+-- ======= โหมดบังคับ Key UI ก่อนเสมอ =======
+if FORCE_KEY_UI then
+    log("FORCE_KEY_UI = true → show Key UI (first)")
+    startKeyWatcher(120)
+    startDownloadWatcher(120)
+
+    local ok, src = http_get_retry(URL_KEYS, 5, 0.8)
+    if not ok then
+        log("Key UI fetch failed (cannot continue without Key UI)")
+        return
     end
-    if not UFO.state.mainStarted then
-        log("Watchdog: forcing Main (dev)")
-        showMain()
+    do
+        local patched = src
+        local injected = 0
+        -- FIX: เรียก Download เฉพาะเมื่อ KEY_OK จริง
+        patched, injected = patched:gsub(
+            "gui:Destroy%(%);?",
+            [[
+if _G and _G.UFO_HUBX_KEY_OK and _G.UFO_StartDownload then _G.UFO_StartDownload() end
+gui:Destroy();
+]]
+        )
+        if injected == 0 then
+            -- สำรอง: inject หลังข้อความ "✅ Key accepted"
+            patched, injected = patched:gsub(
+                'btnSubmit.Text%s*=%s*"✅ Key accepted"',
+                [[btnSubmit.Text = "✅ Key accepted"
+if _G and _G.UFO_StartDownload then _G.UFO_StartDownload() end
+]]
+            )
+        end
+        if injected > 0 then
+            log("Patched Key UI to call UFO_StartDownload() only when key is OK.")
+            src = patched
+        else
+            log("No patch point found in Key UI (ok if it calls itself).")
+        end
     end
-end)
+    local ok2, err = safe_loadstring(src, "UFOHubX_Key")
+    if not ok2 then log("Key UI run failed: "..tostring(err)) end
+    return
+end
+
+-- ======= โหมดปกติ (ไม่ force) =======
+if valid then
+    log("Key valid → skip Key UI → go Download")
+    _G.UFO_HUBX_KEY_OK   = true
+    _G.UFO_HUBX_KEY      = cur.key
+    _G.UFO_HUBX_KEY_EXP  = cur.expires_at
+    _G.UFO_HUBX_KEY_PERM = cur.permanent and true or false
+
+    startDownloadWatcher(90)
+    local ok, src = http_get_retry(URL_DOWNLOADS, 5, 0.8)
+    if not ok then
+        log("Download UI fetch failed on skip-key path → Force Main")
+        if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
+        return
+    end
+    do
+        local patched = src
+        local injected = 0
+        patched, injected = patched:gsub(
+            "gui:Destroy%(%);?",
+            [[
+if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
+gui:Destroy();
+]]
+        )
+        if injected > 0 then
+            log("Patched Download UI (skip-key path) to always call UFO_ShowMain().")
+            src = patched
+        end
+    end
+    local ok2, err = safe_loadstring(src, "UFOHubX_Download")
+    if not ok2 then
+        log("Download UI run failed (skip-key path): "..tostring(err))
+        if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
+        return
+    end
+else
+    log("No valid key → show Key UI")
+    startKeyWatcher(120)
+    startDownloadWatcher(120)
+
+    local ok, src = http_get_retry(URL_KEYS, 5, 0.8)
+    if not ok then
+        log("Key UI fetch failed (cannot continue without Key UI)")
+        return
+    end
+    do
+        local patched = src
+        local injected = 0
+        -- FIX: เรียก Download เฉพาะเมื่อ KEY_OK จริง
+        patched, injected = patched:gsub(
+            "gui:Destroy%(%);?",
+            [[
+if _G and _G.UFO_HUBX_KEY_OK and _G.UFO_StartDownload then _G.UFO_StartDownload() end
+gui:Destroy();
+]]
+        )
+        if injected == 0 then
+            patched, injected = patched:gsub(
+                'btnSubmit.Text%s*=%s*"✅ Key accepted"',
+                [[btnSubmit.Text = "✅ Key accepted"
+if _G and _G.UFO_StartDownload then _G.UFO_StartDownload() end
+]]
+            )
+        end
+        if injected > 0 then
+            log("Patched Key UI to call UFO_StartDownload() only when key is OK.")
+            src = patched
+        else
+            log("No patch point found in Key UI (ok if it calls itself).")
+        end
+    end
+    local ok2, err = safe_loadstring(src, "UFOHubX_Key")
+    if not ok2 then
+        log("Key UI run failed: "..tostring(err))
+        return
+    end
+end
+
+-- Done boot loader
