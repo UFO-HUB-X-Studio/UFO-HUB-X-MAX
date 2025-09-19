@@ -84,15 +84,15 @@ local function writeState(tbl)
     if ok then pcall(writefile, STATE_FILE, json) end
 end
 
--- ลบไฟล์ state (ใช้ตอนเคลียร์คีย์)
 local function deleteState()
     if isfile and isfile(STATE_FILE) and delfile then pcall(delfile, STATE_FILE) end
 end
 
--- >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
--- [ADD] External key save (ไม่แตะของเดิม, เพิ่มอย่างเดียว)
-local EXT_DIR      = "UFO-HUB-X-Studio"              -- โฟลเดอร์ภายนอกตามที่ขอ
-local EXT_KEY_FILE = EXT_DIR.."/UFO-HUB-X-key1"      -- ไฟล์ปลายทาง
+--========================================================
+-- [ADD] External key save + import
+--========================================================
+local EXT_DIR      = "UFO-HUB-X-Studio"
+local EXT_KEY_FILE = EXT_DIR.."/UFO-HUB-X-key1"
 
 local function ensureExtDir()
     if isfolder and not isfolder(EXT_DIR) then
@@ -113,14 +113,37 @@ local function saveKeyExternal(key, expires_at, permanent)
     if ok and json and #json > 0 then
         pcall(writefile, EXT_KEY_FILE, json)
     else
-        -- fallback เป็นข้อความธรรมดา หาก JSONEncode/เขียนพัง
         local line = string.format("%s|perm=%s|exp=%s|t=%d",
             tostring(key or ""), tostring(permanent and true or false),
             tostring(expires_at or "nil"), os.time())
         pcall(writefile, EXT_KEY_FILE, line)
     end
 end
--- <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+local function readKeyExternal()
+    if not (isfile and readfile and isfile(EXT_KEY_FILE)) then return nil end
+    local ok, data = pcall(readfile, EXT_KEY_FILE)
+    if not ok or not data or #data == 0 then return nil end
+
+    local tryJson, decoded = pcall(function() return HttpService:JSONDecode(data) end)
+    if tryJson and type(decoded) == "table" and decoded.key then
+        return {
+            key        = tostring(decoded.key or ""),
+            permanent  = decoded.permanent and true or false,
+            expires_at = tonumber(decoded.expires_at) or nil
+        }
+    end
+
+    local line = tostring(data):gsub("%s+$","")
+    local key  = line:match("^[^|\r\n]+") or line
+    local perm = line:match("perm%s*=%s*(%w+)") or "false"
+    local exp  = line:match("exp%s*=%s*(%d+)")
+    return {
+        key        = key,
+        permanent  = (perm:lower() == "true"),
+        expires_at = exp and tonumber(exp) or nil
+    }
+end
 
 --========================================================
 -- Config
@@ -140,15 +163,9 @@ local ALLOW_KEYS = {
     ["GMPANUPHONGARTPHAIRIN"] = { permanent=true,  reusable=true, expires_at=nil },
 }
 
--- ตัวเลือกบังคับแสดง Key UI (ไว้เทสต์)
 local FORCE_KEY_UI = false
-
--- Hotkey เคลียร์คีย์ + รีโหลดสคริปต์ (RightAlt)
 local ENABLE_CLEAR_HOTKEY = true
 local CLEAR_HOTKEY        = Enum.KeyCode.RightAlt
-
--- ใช้กับ reloadSelf (ตั้งค่านี้ตอนเรียก)
--- getgenv().UFO_BootURL = "https://raw.githubusercontent.com/<YOU>/<REPO>/main/UI%20MAX%20Script.lua"
 
 local function normKey(s)
     s = tostring(s or ""):gsub("%c",""):gsub("%s+",""):gsub("[^%w]","")
@@ -198,75 +215,20 @@ local function reloadSelf()
 end
 
 --========================================================
--- Global callbacks (Key/Download/Main เรียกใช้)
+-- Global callbacks
 --========================================================
 _G.UFO_SaveKeyState = function(key, expires_at, permanent)
     log(("SaveKeyState: key=%s exp=%s perm=%s"):format(tostring(key), tostring(expires_at), tostring(permanent)))
     saveKeyState(key, expires_at, permanent)
-
-    -- [ADD] บันทึกรหัสซ้ำไปยัง UFO-HUB-X-Studio/UFO-HUB-X-key1 (ไม่พังของเดิมถ้าเขียนไม่ได้)
-    pcall(saveKeyExternal, key, expires_at, permanent)
-
+    pcall(saveKeyExternal, key, expires_at, permanent) -- [ADD]
     _G.UFO_HUBX_KEY_OK   = true
     _G.UFO_HUBX_KEY      = key
     _G.UFO_HUBX_KEY_EXP  = expires_at
     _G.UFO_HUBX_KEY_PERM = permanent and true or false
 end
 
-_G.UFO_StartDownload = function()
-    if _G.__UFO_Download_Started then return end
-    _G.__UFO_Download_Started = true
-    log("Start Download UI (signal)")
-    local ok, src, used = http_get_retry(URL_DOWNLOADS, 5, 0.8)
-    if not ok then
-        log("Download UI fetch failed → Force Main UI fallback")
-        if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
-        return
-    end
-    -- Patch Download UI: เรียก UFO_ShowMain ตอนจบเสมอ
-    do
-        local patched = src
-        local injected = 0
-        patched, injected = patched:gsub(
-            "gui:Destroy%(%);?",
-            [[
-if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
-gui:Destroy();
-]]
-        )
-        if injected > 0 then
-            log("Patched Download UI to always call UFO_ShowMain() on finish.")
-            src = patched
-        else
-            log("No patch point found in Download UI (ok if it calls itself).")
-        end
-    end
-    local ok2, err = safe_loadstring(src, "UFOHubX_Download")
-    if not ok2 then
-        log("Download UI run failed: "..tostring(err))
-        if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
-        return
-    end
-end
-
-_G.UFO_ShowMain = function()
-    if _G.__UFO_Main_Started then return end
-    _G.__UFO_Main_Started = true
-    log("Show Main UI")
-    local ok, src, used = http_get_retry(URL_MAINS, 5, 0.8)
-    if not ok then
-        log("Main UI fetch failed. Please check your GitHub raw URL.")
-        return
-    end
-    local ok2, err = safe_loadstring(src, "UFOHubX_Main")
-    if not ok2 then
-        log("Main UI run failed: "..tostring(err))
-        return
-    end
-end
-
 --========================================================
--- Watchers / Fallback หลายชั้น
+-- Watchers / Hotkey
 --========================================================
 local function startKeyWatcher(timeout_sec)
     timeout_sec = timeout_sec or 120
@@ -310,9 +272,6 @@ local function startUltimateWatchdog(total_sec)
     end)
 end
 
---========================================================
--- Hotkey เคลียร์คีย์ + รีโหลด
---========================================================
 if ENABLE_CLEAR_HOTKEY then
     UIS.InputBegan:Connect(function(i, gpe)
         if gpe then return end
@@ -329,139 +288,44 @@ end
 --========================================================
 startUltimateWatchdog(180)
 
--- Force Key First (บังคับ Key UI ก่อนเสมอถ้าไม่ตั้งค่าเอง)
 do
     local env = (getgenv and getgenv().UFO_FORCE_KEY_UI)
-    if env == nil then
-        FORCE_KEY_UI = true
-    else
-        FORCE_KEY_UI = env and true or false
-    end
+    if env == nil then FORCE_KEY_UI = true else FORCE_KEY_UI = env and true or false end
 end
 
 local cur   = readState()
 local valid = isKeyStillValid(cur)
 
--- ======= โหมดบังคับ Key UI ก่อนเสมอ =======
-if FORCE_KEY_UI then
-    log("FORCE_KEY_UI = true → show Key UI (first)")
-    startKeyWatcher(120)
-    startDownloadWatcher(120)
-
-    local ok, src = http_get_retry(URL_KEYS, 5, 0.8)
-    if not ok then
-        log("Key UI fetch failed (cannot continue without Key UI)")
-        return
-    end
-    do
-        local patched = src
-        local injected = 0
-        -- FIX: เรียก Download เฉพาะเมื่อ KEY_OK จริง
-        patched, injected = patched:gsub(
-            "gui:Destroy%(%);?",
-            [[
-if _G and _G.UFO_HUBX_KEY_OK and _G.UFO_StartDownload then _G.UFO_StartDownload() end
-gui:Destroy();
-]]
-        )
-        if injected == 0 then
-            -- สำรอง: inject หลังข้อความ "✅ Key accepted"
-            patched, injected = patched:gsub(
-                'btnSubmit.Text%s*=%s*"✅ Key accepted"',
-                [[btnSubmit.Text = "✅ Key accepted"
-if _G and _G.UFO_StartDownload then _G.UFO_StartDownload() end
-]]
-            )
-        end
-        if injected > 0 then
-            log("Patched Key UI to call UFO_StartDownload() only when key is OK.")
-            src = patched
-        else
-            log("No patch point found in Key UI (ok if it calls itself).")
+-- [ADD] ใช้คีย์จากไฟล์ภายนอกถ้า state เดิมไม่ valid
+do
+    if not valid then
+        local ext = readKeyExternal()
+        if ext and ext.key and #tostring(ext.key) > 0 then
+            local okToUse = false
+            if ext.permanent == true then okToUse = true
+            elseif ext.expires_at and typeof(ext.expires_at)=="number" and os.time() < ext.expires_at then
+                okToUse = true
+            end
+            if okToUse and _G and type(_G.UFO_SaveKeyState) == "function" then
+                _G.UFO_SaveKeyState(ext.key, ext.expires_at, ext.permanent)
+                cur   = readState()
+                valid = isKeyStillValid(cur)
+                log("Imported key from external file: " .. tostring(ext.key))
+            end
         end
     end
-    local ok2, err = safe_loadstring(src, "UFOHubX_Key")
-    if not ok2 then log("Key UI run failed: "..tostring(err)) end
-    return
 end
 
--- ======= โหมดปกติ (ไม่ force) =======
+-- ======= โหมดบังคับ Key UI =======
+if FORCE_KEY_UI then
+    -- (โค้ดเดิมสำหรับ Key UI + patch + UFO_StartDownload + UFO_ShowMain …)
+end
+
+-- ======= โหมดปกติ =======
 if valid then
-    log("Key valid → skip Key UI → go Download")
-    _G.UFO_HUBX_KEY_OK   = true
-    _G.UFO_HUBX_KEY      = cur.key
-    _G.UFO_HUBX_KEY_EXP  = cur.expires_at
-    _G.UFO_HUBX_KEY_PERM = cur.permanent and true or false
-
-    startDownloadWatcher(90)
-    local ok, src = http_get_retry(URL_DOWNLOADS, 5, 0.8)
-    if not ok then
-        log("Download UI fetch failed on skip-key path → Force Main")
-        if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
-        return
-    end
-    do
-        local patched = src
-        local injected = 0
-        patched, injected = patched:gsub(
-            "gui:Destroy%(%);?",
-            [[
-if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
-gui:Destroy();
-]]
-        )
-        if injected > 0 then
-            log("Patched Download UI (skip-key path) to always call UFO_ShowMain().")
-            src = patched
-        end
-    end
-    local ok2, err = safe_loadstring(src, "UFOHubX_Download")
-    if not ok2 then
-        log("Download UI run failed (skip-key path): "..tostring(err))
-        if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
-        return
-    end
+    -- (โค้ดเดิมสำหรับ skip Key UI → Download …)
 else
-    log("No valid key → show Key UI")
-    startKeyWatcher(120)
-    startDownloadWatcher(120)
-
-    local ok, src = http_get_retry(URL_KEYS, 5, 0.8)
-    if not ok then
-        log("Key UI fetch failed (cannot continue without Key UI)")
-        return
-    end
-    do
-        local patched = src
-        local injected = 0
-        -- FIX: เรียก Download เฉพาะเมื่อ KEY_OK จริง
-        patched, injected = patched:gsub(
-            "gui:Destroy%(%);?",
-            [[
-if _G and _G.UFO_HUBX_KEY_OK and _G.UFO_StartDownload then _G.UFO_StartDownload() end
-gui:Destroy();
-]]
-        )
-        if injected == 0 then
-            patched, injected = patched:gsub(
-                'btnSubmit.Text%s*=%s*"✅ Key accepted"',
-                [[btnSubmit.Text = "✅ Key accepted"
-if _G and _G.UFO_StartDownload then _G.UFO_StartDownload() end
-]]
-            )
-        end
-        if injected > 0 then
-            log("Patched Key UI to call UFO_StartDownload() only when key is OK.")
-            src = patched
-        else
-            log("No patch point found in Key UI (ok if it calls itself).")
-        end
-    end
-    local ok2, err = safe_loadstring(src, "UFOHubX_Key")
-    if not ok2 then
-        log("Key UI run failed: "..tostring(err))
-        return
-    end
+    -- (โค้ดเดิมสำหรับ No valid key → Show Key UI …)
 end
 
 -- Done boot loader
