@@ -1,261 +1,274 @@
 --========================================================
--- UFO HUB X — KEY UI (FULL MOBILE SAFE + SINGLETON)
+-- UFO HUB X — KeyGate.lua (Minimal Key Gate with Expiry)
+-- - มีแค่หน้า Key อย่างเดียว
+-- - กดผ่านแล้ว UI ปิด, เซฟอายุคีย์ไว้ในไฟล์
+-- - คีย์หมดอายุ เด้ง UI Key ขึ้นมาใหม่อัตโนมัติ
+-- - รองรับ Delta / loadstring(game:HttpGet(...)) 100%
 --========================================================
-local TS = game:GetService("TweenService")
-local CG = game:GetService("CoreGui")
-local Http = game:GetService("HttpService")
-local Players = game:GetService("Players")
-local LP = Players.LocalPlayer
 
--- -------- CONFIG --------
-local LOGO_ID = 112676905543996
-local ACCENT  = Color3.fromRGB(0,255,140)
-local BG      = Color3.fromRGB(10,10,10)
-local SUB     = Color3.fromRGB(28,28,28)
-local FG      = Color3.fromRGB(235,235,235)
+-------------------- CONFIG --------------------
+local SERVER_BASES = {
+    "https://ufo-hub-x-key-umoq.onrender.com", -- เปลี่ยนเป็นเซิร์ฟเวอร์ของคุณได้
+    -- "https://backup-server-url.example.com",
+}
+local SAVE_FILE         = "ufo_key_state.json"     -- ไฟล์เก็บสถานะคีย์
+local DEFAULT_TTL_SECS  = 48*3600                  -- สำรอง 48 ชม. ถ้า server ไม่ส่ง expires_at
+local ALLOW_KEYS = {                                -- คีย์ผ่านแน่ (ถ้าต้องการ)
+    ["JJJMAX"] = true,
+    ["GMPANUPHONGARTPHAIRIN"] = true,
+}
 
--- เซิร์ฟเวอร์ของเพื่อน (แก้ได้)
-local SERVER = "https://ufo-hub-x-key-umoq.onrender.com"
+-------------------- Services --------------------
+local Players     = game:GetService("Players")
+local CoreGui     = game:GetService("CoreGui")
+local TweenService= game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+local LP          = Players.LocalPlayer
 
--- จำสถานะคีย์ (48 ชม. ถ้า server ไม่ส่งเวลาหมดอายุมา)
-local DEFAULT_TTL = 48*3600
-local SAVE_KEY = true  -- true = จำคีย์ข้ามเซสชัน (ผ่าน _G ก็พอสำหรับ executor ส่วนใหญ่)
-
--- -------- Helpers --------
+-------------------- Helpers: safe parent --------------------
 local function safeParent(gui)
     if syn and syn.protect_gui then pcall(function() syn.protect_gui(gui) end) end
     local ok=false
-    if gethui then ok=pcall(function() gui.Parent = gethui() end) end
-    if not ok then gui.Parent = CG end
+    if gethui then ok = pcall(function() gui.Parent = gethui() end) end
+    if not ok then gui.Parent = CoreGui end
 end
 
-local function make(class, props, kids)
-    local o=Instance.new(class)
-    for k,v in pairs(props or {}) do o[k]=v end
-    for _,c in ipairs(kids or {}) do c.Parent=o end
-    return o
+-------------------- Helpers: file save/load --------------------
+local function canFS() return (isfile and writefile and readfile and makefolder) end
+local function loadState()
+    if not canFS() then return nil end
+    local ok, data = pcall(function()
+        if not isfile(SAVE_FILE) then return nil end
+        local raw = readfile(SAVE_FILE)
+        return HttpService:JSONDecode(raw)
+    end)
+    return ok and data or nil
 end
 
-local function jsonGET(url)
-    local ok, body = pcall(function() return game:HttpGet(url) end)
-    if not ok then return false, "http_error" end
-    local ok2, data = pcall(function() return Http:JSONDecode(body) end)
-    if not ok2 then return false, "json_error" end
-    return true, data
-end
-
-local function now() return os.time() end
-
-local function hasValidSaved()
-    if not SAVE_KEY then return false end
-    local exp = tonumber(_G.UFO_Key_Exp or 0)
-    return exp > now()
-end
-
--- -------- Prevent duplicate UI --------
-do
-    local old = CG:FindFirstChild("UFOHubX_KeyUI")
-    if old then pcall(function() old:Destroy() end) end
-end
-
--- ถ้ามีคีย์ยังไม่หมดอายุ ก็ไม่ต้องโชว์ UI
-if hasValidSaved() then return end
-
--- -------- BUILD UI --------
-local gui = Instance.new("ScreenGui")
-gui.Name = "UFOHubX_KeyUI"
-gui.IgnoreGuiInset = true
-gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-safeParent(gui)
-
-local root = make("Frame", {
-    Parent=gui, AnchorPoint=Vector2.new(0.5,0.5),
-    Position=UDim2.fromScale(0.5,0.52),
-    Size=UDim2.fromOffset(860, 520),
-    BackgroundColor3=BG, BorderSizePixel=0
-},{
-    make("UICorner",{CornerRadius=UDim.new(0,22)}),
-    make("UIStroke",{Color=ACCENT,Thickness=2,Transparency=0.08})
-})
--- รองรับจอเล็ก: clamp ให้ไม่ล้น
-local function fit()
-    local vp = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1280,720)
-    local w = math.clamp(vp.X*0.86, 360, 860)
-    local h = math.clamp(vp.Y*0.66, 360, 520)
-    root.Size = UDim2.fromOffset(w,h)
-end
-fit()
-workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(fit)
-
--- Header bar
-local header = make("Frame", {
-    Parent=root, BackgroundTransparency=0.1,
-    BackgroundColor3=Color3.fromRGB(16,16,16),
-    Size=UDim2.new(1,-28,0,68), Position=UDim2.new(0,14,0,14)
-},{
-    make("UICorner",{CornerRadius=UDim.new(0,16)}),
-    make("UIStroke",{Color=ACCENT,Transparency=0.85})
-})
-make("ImageLabel",{
-    Parent=header, BackgroundTransparency=1,
-    Image="rbxassetid://"..LOGO_ID, Size=UDim2.fromOffset(36,36),
-    Position=UDim2.new(0,16,0,16)
-})
-make("TextLabel",{
-    Parent=header, BackgroundTransparency=1,
-    Position=UDim2.new(0,64,0,18), Size=UDim2.fromOffset(300,32),
-    Font=Enum.Font.GothamBold, TextSize=20, Text="KEY SYSTEM",
-    TextColor3=ACCENT, TextXAlignment=Enum.TextXAlignment.Left
-})
-
--- Body container
-local body = make("Frame",{
-    Parent=root, BackgroundTransparency=1,
-    Position=UDim2.new(0,28,0,100), Size=UDim2.new(1,-56,1,-128)
-},{})
-make("UIListLayout",{
-    Parent=body, FillDirection=Enum.FillDirection.Vertical,
-    HorizontalAlignment=Enum.HorizontalAlignment.Left,
-    VerticalAlignment=Enum.VerticalAlignment.Top, Padding=UDim.new(0,12),
-    SortOrder=Enum.SortOrder.LayoutOrder
-})
-
--- Title
-make("TextLabel",{
-    Parent=body, LayoutOrder=1, BackgroundTransparency=1,
-    Size=UDim2.new(1,0,0,42), Font=Enum.Font.GothamBlack, TextSize=30,
-    Text="Welcome to the,", TextColor3=FG, TextXAlignment=Enum.TextXAlignment.Left
-})
-local titleRow = make("Frame",{Parent=body,LayoutOrder=2,BackgroundTransparency=1,Size=UDim2.new(1,0,0,40)},{})
-make("UIListLayout",{Parent=titleRow,FillDirection=Enum.FillDirection.Horizontal,Padding=UDim.new(0,8)})
-make("TextLabel",{Parent=titleRow,BackgroundTransparency=1,AutomaticSize=Enum.AutomaticSize.X,Font=Enum.Font.GothamBlack,TextSize=32,Text="UFO",TextColor3=ACCENT})
-make("TextLabel",{Parent=titleRow,BackgroundTransparency=1,AutomaticSize=Enum.AutomaticSize.X,Font=Enum.Font.GothamBlack,TextSize=32,Text="HUB X",TextColor3=Color3.new(1,1,1)})
-
--- Key label
-make("TextLabel",{
-    Parent=body, LayoutOrder=3, BackgroundTransparency=1, Size=UDim2.new(1,0,0,20),
-    Font=Enum.Font.Gotham, TextSize=16, Text="Key", TextColor3=Color3.fromRGB(200,200,200),
-    TextXAlignment=Enum.TextXAlignment.Left
-})
-
--- Key input
-local keyStroke
-local keyBox = make("TextBox",{
-    Parent=body, LayoutOrder=4, ClearTextOnFocus=false, PlaceholderText="insert your key here",
-    Font=Enum.Font.Gotham, TextSize=16, Text="", TextColor3=FG,
-    BackgroundColor3=SUB, BorderSizePixel=0, Size=UDim2.new(1,0,0,44)
-},{
-    make("UICorner",{CornerRadius=UDim.new(0,12)}),
-    (function() keyStroke = make("UIStroke",{Color=ACCENT,Transparency=0.75}); return keyStroke end)()
-})
-
--- Submit button
-local btnSubmit = make("TextButton",{
-    Parent=body, LayoutOrder=5, Text="🔒  Submit Key",
-    Font=Enum.Font.GothamBlack, TextSize=20, TextColor3=Color3.new(1,1,1),
-    AutoButtonColor=false, BackgroundColor3=Color3.fromRGB(210,60,60),
-    BorderSizePixel=0, Size=UDim2.new(1,0,0,48)
-},{
-    make("UICorner",{CornerRadius=UDim.new(0,14)})
-})
-
--- Get Key button
-local btnGet = make("TextButton",{
-    Parent=body, LayoutOrder=6, Text="🔑  Get Key",
-    Font=Enum.Font.GothamBold, TextSize=18, TextColor3=Color3.new(1,1,1),
-    AutoButtonColor=false, BackgroundColor3=Color3.fromRGB(36,36,36),
-    BorderSizePixel=0, Size=UDim2.new(1,0,0,44)
-},{
-    make("UICorner",{CornerRadius=UDim.new(0,12)}),
-    make("UIStroke",{Color=ACCENT,Transparency=0.6})
-})
-
--- Status label
-local status = make("TextLabel",{
-    Parent=body, LayoutOrder=7, BackgroundTransparency=1,
-    Size=UDim2.new(1,0,0,22), Font=Enum.Font.Gotham, TextSize=14, Text="",
-    TextColor3=Color3.fromRGB(200,200,200), TextXAlignment=Enum.TextXAlignment.Left
-})
-
-local function setStatus(t, ok)
-    status.Text = t or ""
-    if ok==nil then
-        status.TextColor3 = Color3.fromRGB(200,200,200)
-    elseif ok then
-        status.TextColor3 = Color3.fromRGB(120,255,170)
-    else
-        status.TextColor3 = Color3.fromRGB(255,120,120)
-    end
-end
-
--- -------- Actions --------
-local function flashError()
-    local old = keyStroke.Color
-    TS:Create(keyStroke, TweenInfo.new(.07), {Color=Color3.fromRGB(255,90,90), Transparency=0}):Play()
-    task.delay(.25, function()
-        TS:Create(keyStroke, TweenInfo.new(.12), {Color=old, Transparency=0.75}):Play()
+local function saveState(tbl)
+    if not canFS() then return end
+    pcall(function()
+        local raw = HttpService:JSONEncode(tbl or {})
+        writefile(SAVE_FILE, raw)
     end)
 end
 
-local function acceptKey(k, expUnix)
-    -- เก็บไว้ (ง่ายๆผ่าน _G)
-    if SAVE_KEY then
-        _G.UFO_Key_Value = k
-        _G.UFO_Key_Exp   = tonumber(expUnix) or (now()+DEFAULT_TTL)
+-------------------- HTTP helpers --------------------
+local function http_get(url)
+    if http and http.request then
+        local ok,res = pcall(http.request, {Url=url, Method="GET"})
+        if ok and res and (res.Body or res.body) then return true, (res.Body or res.body) end
     end
-    -- ปิด UI
-    TS:Create(root, TweenInfo.new(0.15), {BackgroundTransparency=1}):Play()
-    for _,d in ipairs(root:GetDescendants()) do
-        pcall(function()
-            if d:IsA("TextLabel") or d:IsA("TextButton") or d:IsA("TextBox") then
-                TS:Create(d, TweenInfo.new(0.15), {TextTransparency=1, BackgroundTransparency=1}):Play()
-            elseif d:IsA("ImageLabel") then
-                TS:Create(d, TweenInfo.new(0.15), {ImageTransparency=1}):Play()
-            elseif d:IsA("UIStroke") then
-                TS:Create(d, TweenInfo.new(0.15), {Transparency=1}):Play()
+    if syn and syn.request then
+        local ok,res = pcall(syn.request, {Url=url, Method="GET"})
+        if ok and res and (res.Body or res.body) then return true, (res.Body or res.body) end
+    end
+    local ok,body = pcall(function() return game:HttpGet(url) end)
+    if ok and body then return true, body end
+    return false, "http_failed"
+end
+
+local function http_json_get(url)
+    local ok, body = http_get(url)
+    if not ok or not body then return false, nil end
+    local okj, data = pcall(function() return HttpService:JSONDecode(tostring(body)) end)
+    if not okj then return false, nil end
+    return true, data
+end
+
+local function json_get_with_failover(path_qs)
+    local lastErr
+    for _,base in ipairs(SERVER_BASES) do
+        local url = base..path_qs
+        for i=0,2 do
+            if i>0 then task.wait(0.6*i) end
+            local ok, data = http_json_get(url)
+            if ok and data then return true, data end
+            lastErr = "err"
+        end
+    end
+    return false, lastErr
+end
+
+-------------------- Key verify --------------------
+local function normKey(s)
+    s = tostring(s or ""):gsub("%c",""):gsub("%s+",""):gsub("[^%w]","")
+    return string.upper(s)
+end
+
+local function verifyWithServer(k)
+    local nk = normKey(k)
+    if ALLOW_KEYS[nk] then
+        return true, os.time() + DEFAULT_TTL_SECS
+    end
+    local uid = tostring(LP and LP.UserId or "")
+    local qs  = string.format("/verify?key=%s&uid=%s&format=json",
+        HttpService:UrlEncode(k), HttpService:UrlEncode(uid))
+    local ok, data = json_get_with_failover(qs)
+    if not ok or not data then return false end
+    if data.valid == true or (data.ok and data.valid) then
+        local exp = tonumber(data.expires_at) or (os.time() + DEFAULT_TTL_SECS)
+        return true, exp
+    end
+    return false
+end
+
+-------------------- UI (Key only) --------------------
+local function showKeyUI(onAccept)
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "UFOHubX_KeyUI"
+    gui.IgnoreGuiInset = true
+    gui.ResetOnSpawn   = false
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    safeParent(gui)
+
+    local panel = Instance.new("Frame")
+    panel.Size = UDim2.fromOffset(720, 260)
+    panel.AnchorPoint = Vector2.new(0.5,0.5)
+    panel.Position = UDim2.fromScale(0.5,0.5)
+    panel.BackgroundColor3 = Color3.fromRGB(14,14,14)
+    panel.Parent = gui
+
+    Instance.new("UICorner", panel).CornerRadius = UDim.new(0,18)
+    local stroke = Instance.new("UIStroke", panel)
+    stroke.Color = Color3.fromRGB(0,255,140); stroke.Transparency = 0.1
+
+    local title = Instance.new("TextLabel")
+    title.BackgroundTransparency = 1
+    title.Font = Enum.Font.GothamBlack
+    title.TextSize = 28
+    title.Text = "KEY SYSTEM — UFO HUB X"
+    title.TextColor3 = Color3.fromRGB(230,230,230)
+    title.Size = UDim2.new(1, -40, 0, 40)
+    title.Position = UDim2.fromOffset(20, 16)
+    title.Parent = panel
+
+    local tb = Instance.new("TextBox")
+    tb.PlaceholderText = "insert your key here"
+    tb.Font = Enum.Font.Gotham
+    tb.TextSize = 16
+    tb.Text = ""
+    tb.TextColor3 = Color3.fromRGB(230,230,230)
+    tb.BackgroundColor3 = Color3.fromRGB(30,30,30)
+    tb.Size = UDim2.new(1,-60,0,40)
+    tb.Position = UDim2.fromOffset(30, 90)
+    tb.Parent = panel
+    Instance.new("UICorner", tb).CornerRadius = UDim.new(0,12)
+
+    local btn = Instance.new("TextButton")
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 18
+    btn.Text = "🔒  Submit Key"
+    btn.TextColor3 = Color3.new(1,1,1)
+    btn.AutoButtonColor = false
+    btn.BackgroundColor3 = Color3.fromRGB(210,60,60)
+    btn.Size = UDim2.new(1,-60,0,46)
+    btn.Position = UDim2.fromOffset(30, 150)
+    btn.Parent = panel
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0,14)
+
+    local status = Instance.new("TextLabel")
+    status.BackgroundTransparency = 1
+    status.Font = Enum.Font.Gotham
+    status.TextSize = 14
+    status.TextColor3 = Color3.fromRGB(200,200,200)
+    status.Text = ""
+    status.Size = UDim2.new(1,-60,0,22)
+    status.Position = UDim2.fromOffset(30, 202)
+    status.Parent = panel
+
+    local submitting = false
+    local function setOKUI()
+        btn.BackgroundColor3 = Color3.fromRGB(120,255,170)
+        btn.Text = "✅ Key accepted"
+        btn.TextColor3 = Color3.new(0,0,0)
+    end
+
+    local function doSubmit()
+        if submitting then return end
+        submitting = true
+        local k = tb.Text or ""
+        if k == "" then
+            status.TextColor3 = Color3.fromRGB(255,120,120)
+            status.Text = "โปรดใส่รหัสก่อน"
+            submitting = false
+            return
+        end
+        status.TextColor3 = Color3.fromRGB(200,200,200)
+        status.Text = "กำลังตรวจสอบคีย์..."
+        btn.Text = "⏳ Verifying..."
+
+        task.spawn(function()
+            local ok, exp = verifyWithServer(k)
+            if not ok then
+                btn.BackgroundColor3 = Color3.fromRGB(255,80,80)
+                btn.Text = "❌ Invalid Key"
+                status.TextColor3 = Color3.fromRGB(255,120,120)
+                status.Text = "รหัสไม่ถูกต้อง หรือเชื่อมต่อเซิร์ฟเวอร์ไม่ได้"
+                task.wait(1.1)
+                btn.Text = "🔒  Submit Key"
+                btn.BackgroundColor3 = Color3.fromRGB(210,60,60)
+                submitting = false
+                return
             end
+
+            -- ผ่าน ✅
+            setOKUI()
+            status.TextColor3 = Color3.fromRGB(120,255,170)
+            status.Text = "ยืนยันคีย์สำเร็จ"
+
+            -- เซฟสถานะ
+            saveState({ key = k, expires_at = tonumber(exp) or (os.time()+DEFAULT_TTL_SECS) })
+
+            -- ปิด UI แล้วเรียก callback
+            task.wait(0.15)
+            pcall(function() gui:Destroy() end)
+            if onAccept then pcall(onAccept) end
         end)
     end
-    task.delay(0.18, function() gui:Destroy() end)
+
+    btn.MouseButton1Click:Connect(doSubmit)
+    tb.FocusLost:Connect(function(enter) if enter then doSubmit() end end)
+
+    return gui
 end
 
-local function submit()
-    local k = (keyBox.Text or ""):gsub("^%s+",""):gsub("%s+$","")
-    if k=="" then
-        setStatus("โปรดใส่คีย์ก่อน", false); flashError(); return
-    end
-    btnSubmit.Text = "⏳ Verifying..."
-    btnSubmit.BackgroundColor3 = Color3.fromRGB(70,170,120)
-    setStatus("กำลังตรวจสอบคีย์...", nil)
-
-    -- เรียก /verify
-    local url = string.format("%s/verify?key=%s&uid=%s&format=json",
-        SERVER, Http:UrlEncode(k), Http:UrlEncode(tostring(LP and LP.UserId or "")))
-    local ok, data = jsonGET(url)
-    if not ok then
-        setStatus("เชื่อมต่อเซิร์ฟเวอร์ไม่ได้ ลองใหม่", false)
-        btnSubmit.Text = "🔒  Submit Key"; btnSubmit.BackgroundColor3 = Color3.fromRGB(210,60,60)
-        flashError(); return
-    end
-    if data.valid then
-        btnSubmit.Text = "✅ Key accepted"
-        btnSubmit.TextColor3 = Color3.new(0,0,0)
-        btnSubmit.BackgroundColor3 = Color3.fromRGB(120,255,170)
-        setStatus("ยืนยันคีย์สำเร็จ!", true)
-        acceptKey(k, tonumber(data.expires_at))
-    else
-        setStatus("คีย์ไม่ถูกต้อง", false)
-        btnSubmit.Text = "🔒  Submit Key"; btnSubmit.BackgroundColor3 = Color3.fromRGB(210,60,60)
-        flashError()
-    end
+-------------------- Expiry Watcher (เด้ง Key UI เมื่อหมดอายุ) --------------------
+local function startExpiryWatcher()
+    task.spawn(function()
+        while true do
+            task.wait(30) -- เช็กทุก 30 วิ (พอ)
+            local st = loadState()
+            local now = os.time()
+            if not st or not st.expires_at or now >= tonumber(st.expires_at) then
+                -- หมดอายุแล้ว → ล้างสถานะ + เปิด UI Key ทับ
+                saveState({})
+                if not CoreGui:FindFirstChild("UFOHubX_KeyUI") then
+                    showKeyUI(function() end)
+                end
+            end
+        end
+    end)
 end
 
-btnSubmit.MouseButton1Click:Connect(submit)
+-------------------- BOOT --------------------
+-- 1) ถ้ามีคีย์และยังไม่หมดอายุ → ไม่ต้องแสดง UI
+-- 2) ถ้าไม่มี/หมดอายุ → เปิด UI Key
+local state = loadState()
+local now   = os.time()
+if state and state.expires_at and now < tonumber(state.expires_at) then
+    -- มีคีย์ที่ยังใช้ได้
+    _G.UFO_HUBX_KEY_OK = true
+    _G.UFO_HUBX_KEY    = state.key
+else
+    -- เปิด UI Key เพื่อขอคีย์
+    showKeyUI(function()
+        _G.UFO_HUBX_KEY_OK = true
+        -- ตรงนี้คือ "ผ่านแล้วทำอะไรต่อ" ถ้าต้องการเชื่อมไปเมนหลัก ก็ loadstring ได้เลย
+        -- ตัวอย่าง:
+        -- loadstring(game:HttpGet("https://raw.githubusercontent.com/คุณ/Repo/main/UFO%20HUB%20X%20UI.lua"))()
+    end)
+end
 
-btnGet.MouseButton1Click:Connect(function()
-    local uid = tostring(LP and LP.UserId or "")
-    local link = string.format("%s/getkey?uid=%s", SERVER, Http:UrlEncode(uid))
-    if setclipboard then pcall(setclipboard, link) end
-    btnGet.Text = "✅ Link copied!"
-    task.delay(1.2, function() btnGet.Text = "🔑  Get Key" end)
-end)
+-- เปิดตัวจับหมดอายุเสมอ
+startExpiryWatcher()
