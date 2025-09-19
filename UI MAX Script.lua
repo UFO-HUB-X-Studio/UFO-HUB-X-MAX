@@ -1,9 +1,10 @@
 --========================================================
 -- UFO HUB X — KEY UI (v18+, full drop-in, UNIVERSAL KEY)
--- - API JSON: /verify?key=&uid=   และ   /getkey?uid=
--- - ไม่ผูกกับ place (ใช้ uid อย่างเดียว) ใช้ได้ทุกแผนที่
+-- - API JSON: /verify?key=&uid=&place=  และ  /getkey?uid=&place=
+-- - โหมด Universal: ผูกกับ uid เป็นหลัก (แนวคิดไม่ล็อกแผนที่)
+--   * เพื่อให้เข้ากับเซิร์ฟเวอร์เดิมที่ยังต้องการ place ผมส่ง place ไปด้วย
 -- - จำอายุคีย์ผ่าน _G.UFO_SaveKeyState (48 ชม. หรือ expires_at จาก server)
--- - ปุ่ม Get Key คัดลอกลิงก์พร้อม uid (ฐาน = SERVER_BASES[1])
+-- - ปุ่ม Get Key คัดลอกลิงก์พร้อม uid/place (ใช้ SERVER_BASES[1])
 -- - รองรับหลายเซิร์ฟเวอร์ (failover & retry)
 -- - มี verifyKey()/copyGetKeyUrl() แบบ “อันเก่า” ให้เรียกง่าย
 -- - Fade-out แล้ว Destroy เมื่อสำเร็จ
@@ -104,14 +105,17 @@ local function isAllowedKey(k)
 end
 
 ----------------------------------------------------------------
--- ตรวจคีย์กับ Server (UNIVERSAL: ผูกกับ uid ไม่ผูก place)
+-- ตรวจคีย์กับ Server (UNIVERSAL: ใช้ uid เป็นหลัก; ส่ง place ไปเพื่อเข้ากันได้)
 -- server ตอบ JSON: { ok:true, valid:true/false, expires_at:<unix>, reason:"..." }
 ----------------------------------------------------------------
 local function verifyWithServer(k)
-    local uid = tostring(LP and LP.UserId or "")
-    local qs = string.format("/verify?key=%s&uid=%s&format=json",
+    local uid   = tostring(LP and LP.UserId or "")
+    local place = tostring(game.PlaceId or "")
+    local qs = string.format(
+        "/verify?key=%s&uid=%s&place=%s&format=json",
         HttpService:UrlEncode(k),
-        HttpService:UrlEncode(uid)
+        HttpService:UrlEncode(uid),
+        HttpService:UrlEncode(place)
     )
     local ok, data = json_get_with_failover(qs)
     if not ok or not data then
@@ -130,11 +134,13 @@ end
 -- ใช้ SERVER_BASES[1] เป็นฐานหลัก
 ----------------------------------------------------------------
 local function getKeyUrlForCurrentPlayer()
-    local uid  = tostring(LP and LP.UserId or "")
-    local base = SERVER_BASES[1] or "https://ufo-hub-x-key-umoq.onrender.com"
-    return string.format("%s/getkey?uid=%s",
+    local uid   = tostring(LP and LP.UserId or "")
+    local place = tostring(game.PlaceId or "")
+    local base  = SERVER_BASES[1] or "https://ufo-hub-x-key-umoq.onrender.com"
+    return string.format("%s/getkey?uid=%s&place=%s",
         base,
-        HttpService:UrlEncode(uid)
+        HttpService:UrlEncode(uid),
+        HttpService:UrlEncode(place)
     )
 end
 
@@ -145,15 +151,17 @@ local function copyGetKeyUrl()
     return url
 end
 
--- ตรวจคีย์แบบเก่า: เรียก /verify แล้วเช็คคำว่า "VALID" (UNIVERSAL: ไม่ส่ง place)
+-- ตรวจคีย์แบบเก่า: เรียก /verify แล้วเช็คคำว่า "VALID"
 local function verifyKey(inputKey)
-    local uid  = tostring(LP and LP.UserId or "")
-    local base = SERVER_BASES[1] or "https://ufo-hub-x-key-umoq.onrender.com"
+    local uid   = tostring(LP and LP.UserId or "")
+    local place = tostring(game.PlaceId or "")
+    local base  = SERVER_BASES[1] or "https://ufo-hub-x-key-umoq.onrender.com"
 
-    local url = string.format("%s/verify?key=%s&uid=%s",
+    local url = string.format("%s/verify?key=%s&uid=%s&place=%s",
         base,
         HttpService:UrlEncode(tostring(inputKey or "")),
-        HttpService:UrlEncode(uid)
+        HttpService:UrlEncode(uid),
+        HttpService:UrlEncode(place)
     )
 
     local ok, body = pcall(function() return game:HttpGet(url) end)
@@ -436,7 +444,7 @@ local function doSubmit()
         expires_at = os.time() + (tonumber(meta.ttl) or DEFAULT_TTL_SECONDS)
         print("[UFO-HUB-X] allowed key:", nk, "exp:", expires_at)
     else
-        valid, reason, expires_at = verifyWithServer(k) -- โหมดทน (UNIVERSAL)
+        valid, reason, expires_at = verifyWithServer(k) -- โหมดทน (UNIVERSAL + compat)
         if valid then
             print("[UFO-HUB-X] server verified key:", k, "exp:", expires_at)
         else
@@ -474,7 +482,7 @@ end
 btnSubmit.MouseButton1Click:Connect(doSubmit)
 btnSubmit.Activated:Connect(doSubmit)
 
--------------------- GET KEY (ลิงก์พร้อม uid) --------------------
+-------------------- GET KEY (ลิงก์พร้อม uid/place เพื่อกัน error เดิม) --------------------
 local btnGetKey = make("TextButton", {
     Parent=panel, Text="🔐  Get Key", Font=Enum.Font.GothamBold, TextSize=18,
     TextColor3=Color3.new(1,1,1), AutoButtonColor=false,
@@ -485,39 +493,9 @@ local btnGetKey = make("TextButton", {
     make("UIStroke",{Color=ACCENT, Transparency=0.6})
 })
 btnGetKey.MouseButton1Click:Connect(function()
-    local url = copyGetKeyUrl() -- คัดลอกลิงก์จาก SERVER_BASES[1]
+    local url = copyGetKeyUrl()
+    if setclipboard then pcall(setclipboard, url) end
     btnGetKey.Text = "✅ Link copied!"
     task.delay(1.5,function() btnGetKey.Text="🔐  Get Key" end)
 end)
 
--------------------- SUPPORT --------------------
-local supportRow = make("Frame", {
-    Parent=panel, AnchorPoint = Vector2.new(0.5,1),
-    Position = UDim2.new(0.5,0,1,-18), Size = UDim2.new(1,-56,0,24),
-    BackgroundTransparency = 1
-}, {})
-make("UIListLayout", {
-    Parent = supportRow, FillDirection = Enum.FillDirection.HORIZONTAL,
-    HorizontalAlignment = Enum.HorizontalAlignment.Center,
-    VerticalAlignment   = Enum.VerticalAlignment.Center,
-    SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0,6)
-}, {})
-make("TextLabel", {
-    Parent=supportRow, LayoutOrder=1, BackgroundTransparency=1,
-    Font=Enum.Font.Gotham, TextSize=16, Text="Need support?",
-    TextColor3=Color3.fromRGB(200,200,200), AutomaticSize=Enum.AutomaticSize.X
-}, {})
-local btnDiscord = make("TextButton", {
-    Parent=supportRow, LayoutOrder=2, BackgroundTransparency=1,
-    Font=Enum.Font.GothamBold, TextSize=16, Text="Join the Discord",
-    TextColor3=ACCENT, AutomaticSize=Enum.AutomaticSize.X
-},{})
-btnDiscord.MouseButton1Click:Connect(function()
-    setClipboard(DISCORD_URL)
-    btnDiscord.Text = "✅ Link copied!"
-    task.delay(1.5,function() btnDiscord.Text="Join the Discord" end)
-end)
-
--------------------- Open Animation --------------------
-panel.Position = UDim2.fromScale(0.5,0.5) + UDim2.fromOffset(0,14)
-tween(panel, {Position = UDim2.fromScale(0.5,0.5)}, .18)
