@@ -1,18 +1,76 @@
 --========================================================
--- UFO HUB X — KEY UI (v18+, full drop-in, UNIVERSAL KEY + HARDENED BOOT)
--- - API: /getkey?uid=   และ   /verify?key=&uid=  (ไม่ผูก place)
--- - จำคีย์ผ่าน _G.UFO_SaveKeyState (48ชม. หรือ expires_at จาก server)
--- - ปุ่ม Get Key คัดลอกลิงก์ (ใช้ SERVER_BASES[1])
--- - Failover ระหว่างเซิร์ฟเวอร์ + retry/backoff
--- - safeParent แบบทนทุกเอ็กซิคิวเตอร์ + pcall boot ครอบทั้ง UI
+-- UFO HUB X — ONE FILE LOADER (UI KEY + WATCHDOG + VERIFY)
+-- - วางไฟล์นี้ “เหนือ” สคริปต์หลัก (หรือรันเดี่ยว ๆ) → UI ต้องขึ้น
+-- - ถ้าใช้ร่วมกับสคริปต์หลัก: ให้สคริปต์หลักรอ _G.UFO_HUBX_KEY_OK
+--   ตัวอย่าง: repeat task.wait() until _G.UFO_HUBX_KEY_OK
 --========================================================
 
--------------------- Services --------------------
-local TS   = game:GetService("TweenService")
-local CG   = game:GetService("CoreGui")
-local HttpService = game:GetService("HttpService")
+-------------------- PREP / SAFE ENV --------------------
 local Players = game:GetService("Players")
+local CG      = game:GetService("CoreGui")
+local TS      = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+
+local function _waitGame()
+    pcall(function()
+        if not game:IsLoaded() then game.Loaded:Wait() end
+    end)
+end
+_waitGame()
+
 local LP = Players.LocalPlayer
+local t0 = os.clock()
+repeat
+    LP = Players.LocalPlayer
+    if LP then break end
+    task.wait(0.05)
+until (os.clock() - t0) > 12
+
+local function _getPG(timeout)
+    local pg, t1 = nil, os.clock()
+    repeat
+        if LP then
+            pg = LP:FindFirstChildOfClass("PlayerGui") or LP:WaitForChild("PlayerGui", 2)
+            if pg then break end
+        end
+        task.wait(0.10)
+    until (os.clock() - t1) > (timeout or 6)
+    return pg
+end
+local PREP_PG = _getPG(6)
+
+local function softParent(gui)
+    if not gui then return end
+    pcall(function()
+        if gui:IsA("ScreenGui") then
+            gui.Enabled = true
+            gui.DisplayOrder = 999999
+            gui.ResetOnSpawn = false
+            gui.IgnoreGuiInset = true
+            gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+        end
+    end)
+    if syn and syn.protect_gui then pcall(function() syn.protect_gui(gui) end) end
+    local ok=false
+    if gethui then ok = pcall(function() gui.Parent = gethui() end) end
+    if (not ok) or (not gui.Parent) then
+        ok = pcall(function() gui.Parent = CG end)
+    end
+    if (not ok) or (not gui.Parent) then
+        local pg = PREP_PG or _getPG(4)
+        if pg then pcall(function() gui.Parent = pg end) end
+    end
+end
+
+-- ล้างของเก่าที่ชื่อซ้ำ (ถ้ามี) → ป้องกันชนกัน
+pcall(function()
+    local old = CG:FindFirstChild("UFOHubX_KeyUI")
+    if old and old:IsA("ScreenGui") then
+        old.Enabled = false
+        softParent(old)
+        old:Destroy()
+    end
+end)
 
 -------------------- THEME --------------------
 local LOGO_ID   = 112676905543996
@@ -23,29 +81,22 @@ local SUB       = Color3.fromRGB(22,22,22)
 local RED       = Color3.fromRGB(210,60,60)
 local GREEN     = Color3.fromRGB(60,200,120)
 
--------------------- LINKS --------------------
-local DISCORD_URL = "https://discord.gg/your-server"
-
--- URL เซิร์ฟเวอร์ (ลำดับความสำคัญ)
+-------------------- SERVER CONFIG --------------------
+-- ✅ แก้เฉพาะตรงนี้ถ้ามีโดเมนของตัวเอง
 local SERVER_BASES = {
-    "https://ufo-hub-x-key-umoq.onrender.com",         -- หลัก (แก้เป็นของคุณได้)
-    -- "https://ufo-hub-x-server-key2.onrender.com",   -- สำรอง (ถ้ามี)
+    "https://ufo-hub-x-key-umoq.onrender.com",  -- หลัก
+    -- "https://ufo-hub-x-server-key2.onrender.com",
 }
 
--- อายุคีย์เริ่มต้น
-local DEFAULT_TTL_SECONDS = 48 * 3600 -- 48 ชั่วโมง
+local DEFAULT_TTL_SECONDS = 48*3600
 
-----------------------------------------------------------------
--- Allow-list คีย์พิเศษ (ผ่านแน่)
-----------------------------------------------------------------
+-------------------- ALLOW LIST (คีย์ผ่านแน่) --------------------
 local ALLOW_KEYS = {
-    ["JJJMAX"]                 = { reusable = true,  ttl = DEFAULT_TTL_SECONDS },
-    ["GMPANUPHONGARTPHAIRIN"]  = { reusable = true,  ttl = DEFAULT_TTL_SECONDS },
+    ["JJJMAX"]                 = { reusable = true, ttl = DEFAULT_TTL_SECONDS },
+    ["GMPANUPHONGARTPHAIRIN"]  = { reusable = true, ttl = DEFAULT_TTL_SECONDS },
 }
 
-----------------------------------------------------------------
--- HTTP / JSON helpers
-----------------------------------------------------------------
+-------------------- HELPERS: HTTP/JSON --------------------
 local function http_get(url)
     if http and http.request then
         local ok, res = pcall(http.request, {Url=url, Method="GET"})
@@ -70,12 +121,11 @@ local function http_json_get(url)
     return true, data, nil
 end
 
--- ลองทีละ SERVER_BASE + retry/backoff เผื่อ Render ตื่นช้า
 local function json_get_with_failover(path_qs)
     local last_err = "no_servers"
     for _, base in ipairs(SERVER_BASES) do
         local url = (base..path_qs)
-        for i=0,2 do -- 0s / 0.6s / 1.2s
+        for i=0,2 do
             if i>0 then task.wait(0.6*i) end
             local ok, data, err = http_json_get(url)
             if ok and data then return true, data end
@@ -85,9 +135,7 @@ local function json_get_with_failover(path_qs)
     return false, nil, last_err
 end
 
-----------------------------------------------------------------
--- Normalize & Allow check
-----------------------------------------------------------------
+-------------------- KEY CHECK --------------------
 local function normKey(s)
     s = tostring(s or ""):gsub("%c",""):gsub("%s+",""):gsub("[^%w]","")
     return string.upper(s)
@@ -100,16 +148,10 @@ local function isAllowedKey(k)
     return false, nk, nil
 end
 
-----------------------------------------------------------------
--- ตรวจคีย์กับ Server (UNIVERSAL: ผูกกับ uid ไม่ผูก place)
--- server ตอบ JSON: { ok:true, valid:true/false, expires_at:<unix>, reason:"..." }
-----------------------------------------------------------------
 local function verifyWithServer(k)
     local uid = tostring(LP and LP.UserId or "")
     local qs = string.format("/verify?key=%s&uid=%s&format=json",
-        HttpService:UrlEncode(k),
-        HttpService:UrlEncode(uid)
-    )
+        HttpService:UrlEncode(k), HttpService:UrlEncode(uid))
     local ok, data = json_get_with_failover(qs)
     if not ok or not data then
         return false, "server_unreachable", nil
@@ -122,54 +164,19 @@ local function verifyWithServer(k)
     end
 end
 
-----------------------------------------------------------------
--- === SIMPLE HELPERS (สไตล์เก่า) ===
-----------------------------------------------------------------
 local function getKeyUrlForCurrentPlayer()
     local uid  = tostring(LP and LP.UserId or "")
-    local base = SERVER_BASES[1] or "https://ufo-hub-x-key-umoq.onrender.com"
+    local base = SERVER_BASES[1] or ""
     return string.format("%s/getkey?uid=%s", base, HttpService:UrlEncode(uid))
 end
 
--- คัดลอกลิงก์ Get Key แบบรวดเร็ว
 local function copyGetKeyUrl()
     local url = getKeyUrlForCurrentPlayer()
     if setclipboard then pcall(setclipboard, url) end
     return url
 end
 
--- ตรวจคีย์แบบเก่า: เรียก /verify แล้วเช็คคำว่า "VALID"
-local function verifyKey(inputKey)
-    local uid  = tostring(LP and LP.UserId or "")
-    local base = SERVER_BASES[1] or "https://ufo-hub-x-key-umoq.onrender.com"
-    local url = string.format("%s/verify?key=%s&uid=%s",
-        base, HttpService:UrlEncode(tostring(inputKey or "")), HttpService:UrlEncode(uid))
-    local ok, body = pcall(function() return game:HttpGet(url) end)
-    if ok and tostring(body):upper():find("VALID") then
-        print("VALID"); return true
-    else
-        print("INVALID"); return false
-    end
-end
-
-----------------------------------------------------------------
--- safeParent (เวอร์ชันทน)
-----------------------------------------------------------------
-local function safeParent(gui)
-    if syn and syn.protect_gui then pcall(function() syn.protect_gui(gui) end) end
-    local ok = false
-    if gethui then ok = pcall(function() gui.Parent = gethui() end) end
-    if ok and gui.Parent then return end
-    ok = pcall(function() gui.Parent = CG end)
-    if ok and gui.Parent then return end
-    local plr = Players.LocalPlayer
-    if plr then
-        local pg = plr:FindFirstChildOfClass("PlayerGui") or plr:WaitForChild("PlayerGui",2)
-        if pg then gui.Parent = pg; return end
-    end
-    gui.Parent = CG
-end
-
+-------------------- UI MAKER --------------------
 local function make(class, props, kids)
     local o = Instance.new(class)
     for k,v in pairs(props or {}) do o[k]=v end
@@ -181,28 +188,29 @@ local function tween(o, goal, t)
     TS:Create(o, TweenInfo.new(t or .18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), goal):Play()
 end
 
-local function setClipboard(s) if setclipboard then pcall(setclipboard, s) end end
-
-----------------------------------------------------------------
--- BOOT UI (ครอบด้วย pcall เพื่อกันพัง)
-----------------------------------------------------------------
-local function _ufo_boot()
-    -------------------- ROOT --------------------
+-------------------- BOOT UI --------------------
+local function boot_key_ui()
+    -- ROOT
     local gui = Instance.new("ScreenGui")
     gui.Name = "UFOHubX_KeyUI"
     gui.IgnoreGuiInset = true
     gui.ResetOnSpawn = false
     gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    safeParent(gui)
-    if not gui.Parent then
-        local pg = Players.LocalPlayer and Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
-        if pg then gui.Parent = pg end
-    end
+    softParent(gui)
 
-    -------------------- PANEL --------------------
+    -- WATCHDOG กันโดนปิด/หลุด parent
+    task.spawn(function()
+        while gui and gui.Parent do
+            if not gui.Enabled then pcall(function() gui.Enabled = true end) end
+            if not gui.Parent then softParent(gui) end
+            task.wait(0.25)
+        end
+    end)
+
+    -- PANEL
     local PANEL_W, PANEL_H = 740, 430
     local panel = make("Frame", {
-        Parent=gui, Active=true, Draggable=true,
+        Parent=gui, Active=true,
         Size=UDim2.fromOffset(PANEL_W, PANEL_H),
         AnchorPoint=Vector2.new(0.5,0.5), Position=UDim2.fromScale(0.5,0.5),
         BackgroundColor3=BG_DARK, BorderSizePixel=0, ZIndex=1
@@ -210,8 +218,10 @@ local function _ufo_boot()
         make("UICorner",{CornerRadius=UDim.new(0,22)}),
         make("UIStroke",{Color=ACCENT, Thickness=2, Transparency=0.1})
     })
+    panel.Position = UDim2.fromScale(0.5,0.5) + UDim2.fromOffset(0,12)
+    tween(panel, {Position = UDim2.fromScale(0.5,0.5)}, .18)
 
-    -- ปุ่มปิด
+    -- CLOSE
     local btnClose = make("TextButton", {
         Parent=panel, Text="X", Font=Enum.Font.GothamBold, TextSize=20, TextColor3=Color3.new(1,1,1),
         AutoButtonColor=false, BackgroundColor3=Color3.fromRGB(210,35,50),
@@ -221,7 +231,7 @@ local function _ufo_boot()
     })
     btnClose.MouseButton1Click:Connect(function() gui:Destroy() end)
 
-    -------------------- HEADER --------------------
+    -- HEADER
     local head = make("Frame", {
         Parent=panel, BackgroundTransparency=0.15, BackgroundColor3=Color3.fromRGB(14,14,14),
         Size=UDim2.new(1,-28,0,68), Position=UDim2.new(0,14,0,14), ZIndex=5
@@ -239,18 +249,16 @@ local function _ufo_boot()
         Text="KEY SYSTEM", TextColor3=ACCENT, TextXAlignment=Enum.TextXAlignment.Left, ZIndex=6
     }, {})
 
-    -------------------- TITLE --------------------
+    -- TITLE
     local titleGroup = make("Frame", {
         Parent=panel, BackgroundTransparency=1,
         Position=UDim2.new(0,28,0,102), Size=UDim2.new(1,-56,0,76)
     }, {})
     make("UIListLayout", {
-        Parent = titleGroup,
-        FillDirection = Enum.FillDirection.Vertical,
+        Parent = titleGroup, FillDirection = Enum.FillDirection.Vertical,
         HorizontalAlignment = Enum.HorizontalAlignment.Left,
         VerticalAlignment = Enum.VerticalAlignment.Top,
-        SortOrder = Enum.SortOrder.LayoutOrder,
-        Padding   = UDim.new(0,6)
+        SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0,6)
     }, {})
     make("TextLabel", {
         Parent = titleGroup, LayoutOrder = 1, BackgroundTransparency = 1, Size=UDim2.new(1,0,0,32),
@@ -270,7 +278,7 @@ local function _ufo_boot()
     make("TextLabel", { Parent=titleLine2, LayoutOrder=2, BackgroundTransparency=1,
         Font=Enum.Font.GothamBlack, TextSize=32, Text="HUB X", TextColor3=Color3.new(1,1,1), AutomaticSize=Enum.AutomaticSize.X }, {})
 
-    -------------------- KEY INPUT --------------------
+    -- KEY INPUT
     make("TextLabel", {
         Parent=panel, BackgroundTransparency=1, Position=UDim2.new(0,28,0,188),
         Size=UDim2.new(0,60,0,22), Font=Enum.Font.Gotham, TextSize=16,
@@ -287,7 +295,7 @@ local function _ufo_boot()
         (function() keyStroke = make("UIStroke",{Color=ACCENT, Transparency=0.75}); return keyStroke end)()
     })
 
-    -------------------- SUBMIT BUTTON --------------------
+    -- SUBMIT
     local btnSubmit = make("TextButton", {
         Parent=panel, Text="🔒  Submit Key", Font=Enum.Font.GothamBlack, TextSize=20,
         TextColor3=Color3.new(1,1,1), AutoButtonColor=false,
@@ -297,7 +305,18 @@ local function _ufo_boot()
         make("UICorner",{CornerRadius=UDim.new(0,14)})
     })
 
-    -- Toast
+    -- GET KEY BUTTON
+    local btnGetKey = make("TextButton", {
+        Parent=panel, Text="🔐  Get Key", Font=Enum.Font.GothamBold, TextSize=18,
+        TextColor3=Color3.new(1,1,1), AutoButtonColor=false,
+        BackgroundColor3=SUB, BorderSizePixel=0,
+        Size=UDim2.new(1,-56,0,44), Position=UDim2.new(0,28,0,324)
+    },{
+        make("UICorner",{CornerRadius=UDim.new(0,14)}),
+        make("UIStroke",{Color=ACCENT, Transparency=0.6})
+    })
+
+    -- TOAST
     local toast = make("TextLabel", {
         Parent = panel, BackgroundTransparency = 0.15, BackgroundColor3 = Color3.fromRGB(30,30,30),
         Size = UDim2.fromOffset(0,32), Position = UDim2.new(0.5,0,0,16),
@@ -320,7 +339,7 @@ local function _ufo_boot()
         end)
     end
 
-    -- Status text
+    -- STATUS
     local statusLabel = make("TextLabel", {
         Parent=panel, BackgroundTransparency=1, Position=UDim2.new(0,28,0,268+50+6),
         Size=UDim2.new(1,-56,0,24), Font=Enum.Font.Gotham, TextSize=14, Text="",
@@ -337,7 +356,6 @@ local function _ufo_boot()
         end
     end
 
-    -- Error effect
     local function flashInputError()
         if keyStroke then
             local old = keyStroke.Color
@@ -357,7 +375,6 @@ local function _ufo_boot()
         end)
     end
 
-    -- Fade-out UI
     local function fadeOutAndDestroy()
         for _, d in ipairs(panel:GetDescendants()) do
             pcall(function()
@@ -379,7 +396,7 @@ local function _ufo_boot()
         task.delay(0.22, function() if gui and gui.Parent then gui:Destroy() end end)
     end
 
-    -- Submit states
+    -- SUBMIT STATE
     local submitting = false
     local function refreshSubmit()
         if submitting then return end
@@ -400,7 +417,16 @@ local function _ufo_boot()
     refreshSubmit()
     keyBox.FocusLost:Connect(function(enter) if enter then btnSubmit:Activate() end end)
 
-    -- รวม error
+    -- GET KEY CLICK
+    btnGetKey.MouseButton1Click:Connect(function()
+        local link = getKeyUrlForCurrentPlayer()
+        copyGetKeyUrl()
+        btnGetKey.Text = "✅ Link copied!"
+        setStatus("คัดลอกลิงก์ Get Key แล้ว: "..link, true)
+        task.delay(1.5, function() btnGetKey.Text = "🔐  Get Key" end)
+    end)
+
+    -- ERROR UI
     local function forceErrorUI(mainText, toastText)
         tween(btnSubmit, {BackgroundColor3 = Color3.fromRGB(255,80,80)}, .08)
         btnSubmit.Text = mainText or "❌ Invalid Key"
@@ -415,9 +441,7 @@ local function _ufo_boot()
         end)
     end
 
-    ----------------------------------------------------------------
-    -- Submit flow
-    ----------------------------------------------------------------
+    -- SUBMIT FLOW
     local function doSubmit()
         if submitting then return end
         submitting = true; btnSubmit.AutoButtonColor = false; btnSubmit.Active = false
@@ -438,7 +462,7 @@ local function _ufo_boot()
             expires_at = os.time() + (tonumber(meta.ttl) or DEFAULT_TTL_SECONDS)
             print("[UFO-HUB-X] allowed key:", nk, "exp:", expires_at)
         else
-            valid, reason, expires_at = verifyWithServer(k) -- โหมดทน (UNIVERSAL)
+            valid, reason, expires_at = verifyWithServer(k)
             if valid then
                 print("[UFO-HUB-X] server verified key:", k, "exp:", expires_at)
             else
@@ -455,7 +479,7 @@ local function _ufo_boot()
             return
         end
 
-        -- ผ่าน ✅
+        -- ✅ PASSED
         tween(btnSubmit, {BackgroundColor3 = Color3.fromRGB(120,255,170)}, .10)
         btnSubmit.Text = "✅ Key accepted"
         btnSubmit.TextColor3 = Color3.new(0,0,0)
@@ -471,116 +495,16 @@ local function _ufo_boot()
         task.delay(0.15, function()
             fadeOutAndDestroy()
         end)
-    end -- doSubmit
-
+    end
     btnSubmit.MouseButton1Click:Connect(doSubmit)
     btnSubmit.Activated:Connect(doSubmit)
-
-    -------------------- GET KEY (คัดลอกลิงก์พร้อม uid) --------------------
-    local btnGetKey = make("TextButton", {
-        Parent=panel, Text="🔐  Get Key", Font=Enum.Font.GothamBold, TextSize=18,
-        TextColor3=Color3.new(1,1,1), AutoButtonColor=false,
-        BackgroundColor3=SUB, BorderSizePixel=0,
-        Size=UDim2.new(1,-56,0,44), Position=UDim2.new(0,28,0,324)
-    },{
-        make("UICorner",{CornerRadius=UDim.new(0,14)}),
-        make("UIStroke",{Color=ACCENT, Transparency=0.6})
-    })
-    btnGetKey.MouseButton1Click:Connect(function()
-        local url = copyGetKeyUrl()
-        if setclipboard then pcall(setclipboard, url) end
-        print("[UFO] Get Key URL:", url)
-        btnGetKey.Text = "✅ Link copied!"
-        showToast("คัดลอกลิงก์แล้ว", true)
-        task.delay(1.5,function() btnGetKey.Text="🔐  Get Key" end)
-    end)
-
-    -------------------- SUPPORT --------------------
-    local supportRow = make("Frame", {
-        Parent=panel, AnchorPoint = Vector2.new(0.5,1),
-        Position = UDim2.new(0.5,0,1,-18), Size = UDim2.new(1,-56,0,24),
-        BackgroundTransparency = 1
-    }, {})
-    make("UIListLayout", {
-        Parent = supportRow, FillDirection = Enum.FillDirection.HORIZONTAL,
-        HorizontalAlignment = Enum.HorizontalAlignment.Center,
-        VerticalAlignment   = Enum.VerticalAlignment.Center,
-        SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0,6)
-    }, {})
-    make("TextLabel", {
-        Parent=supportRow, LayoutOrder=1, BackgroundTransparency=1,
-        Font=Enum.Font.Gotham, TextSize=16, Text="Need support?",
-        TextColor3=Color3.fromRGB(200,200,200), AutomaticSize=Enum.AutomaticSize.X
-    }, {})
-    local btnDiscord = make("TextButton", {
-        Parent=supportRow, LayoutOrder=2, BackgroundTransparency=1,
-        Font=Enum.Font.GothamBold, TextSize=16, Text="Join the Discord",
-        TextColor3=ACCENT, AutomaticSize=Enum.AutomaticSize.X
-    },{})
-    btnDiscord.MouseButton1Click:Connect(function()
-        if setclipboard then pcall(setclipboard, DISCORD_URL) end
-        btnDiscord.Text = "✅ Link copied!"
-        task.delay(1.5,function() btnDiscord.Text="Join the Discord" end)
-    end)
-
-    -------------------- Open Animation --------------------
-    panel.Position = UDim2.fromScale(0.5,0.5) + UDim2.fromOffset(0,14)
-    tween(panel, {Position = UDim2.fromScale(0.5,0.5)}, .18)
-end -- _ufo_boot
-
--- ครอบบูตด้วย pcall กันพัง
-do
-    local ok, err = pcall(_ufo_boot)
-    if not ok then warn("[UFO] boot error:", err) end
 end
 
--- ==== FORCE SHOW PATCH (ให้ UI โผล่แน่ๆ ถ้า executor แปลก ๆ) ====
-local function _ufo_force_parent(sg)
-    local ok = false
-    if gethui then ok = pcall(function() sg.Parent = gethui() end) end
-    if not ok or not sg.Parent then
-        ok = pcall(function() sg.Parent = CG end)
-    end
-    if (not ok) or (not sg.Parent) then
-        local plr = Players.LocalPlayer
-        if plr then
-            local pg = plr:FindFirstChildOfClass("PlayerGui") or plr:WaitForChild("PlayerGui", 2)
-            if pg then sg.Parent = pg end
-        end
-    end
-end
+-- 💥 BOOT NOW (เรียกทันทีให้ UI โผล่แน่นอน)
+pcall(boot_key_ui)
 
-task.defer(function()
-    local sg = (gethui and gethui():FindFirstChild("UFOHubX_KeyUI"))
-           or CG:FindFirstChild("UFOHubX_KeyUI")
-           or (Players.LocalPlayer and Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
-               and Players.LocalPlayer:FindFirstChildOfClass("PlayerGui"):FindFirstChild("UFOHubX_KeyUI"))
-
-    if not sg and typeof(_ufo_boot) == "function" then
-        local ok,err = pcall(_ufo_boot)
-        if not ok then warn("[UFO] re-boot error: ", err) end
-        task.wait(0.1)
-        sg = (gethui and gethui():FindFirstChild("UFOHubX_KeyUI")) or CG:FindFirstChild("UFOHubX_KeyUI")
-    end
-    if sg then
-        _ufo_force_parent(sg)
-        sg.Enabled = true
-        sg.IgnoreGuiInset = true
-        print("[UFO] UI forced visible.")
-    else
-        local F = Instance.new("ScreenGui")
-        F.Name = "UFO_Fallback_Probe"
-        _ufo_force_parent(F)
-        local L = Instance.new("TextLabel", F)
-        L.Size = UDim2.fromOffset(360, 36)
-        L.Position = UDim2.fromScale(0.5, 0.12)
-        L.AnchorPoint = Vector2.new(0.5,0.5)
-        L.BackgroundColor3 = Color3.fromRGB(30,30,30)
-        L.TextColor3 = Color3.new(1,1,1)
-        L.Font = Enum.Font.GothamBold
-        L.TextSize = 16
-        L.Text = "UFO UI fallback probe — GUI แสดงได้"
-        print("[UFO] Fallback probe shown.")
-    end
-end)
-       
+-- (ออปชัน) ตัวอย่างการรอคีย์ แล้วค่อยโหลดสคริปต์หลัก:
+-- task.spawn(function()
+--     repeat task.wait() until _G.UFO_HUBX_KEY_OK
+--     -- loadstring(game:HttpGet("https://your-domain/script_main.lua"))()
+-- end)
