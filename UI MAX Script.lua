@@ -499,3 +499,25 @@ btnGetKey.MouseButton1Click:Connect(function()
     task.delay(1.5,function() btnGetKey.Text="🔐  Get Key" end)
 end)
 
+-------------------- SUPPORT ----------------
+utOrder, Padding = UDim.new(0,6)
+}, {})
+make("TextLabel", {
+    Parent=supportRow, LayoutOrder=1, BackgroundTransparency=1,
+    Font=Enum.Font.Gotham, TextSize=16, Text="Need support?",
+    TextColor3=Color3.fromRGB(200,200,200), AutomaticSize=Enum.AutomaticSize.X
+}, {})
+local btnDiscord = make("TextButton", {
+    Parent=supportRow, LayoutOrder=2, BackgroundTransparency=1,
+    Font=Enum.Font.GothamBold, TextSize=16, Text="Join the Discord",
+    TextColor3=ACCENT, AutomaticSize=Enum.AutomaticSize.X
+},{})
+btnDiscord.MouseButton1Click:Connect(function()
+    setClipboard(DISCORD_URL)
+    btnDiscord.Text = "✅ Link copied!"
+    task.delay(1.5,function() btnDiscord.Text="Join the Discord" end)
+end)
+
+-------------------- Open Animation --------------------
+panel.Position = UDim2.fromScale(0.5,0.5) + UDim2.fromOffset(0,14)
+tween(panel, {Position = UDim2.fromScale(0.5,0.5)}, .18)
