@@ -1,331 +1,126 @@
--- UI MAX Script.lua
--- UFO HUB X — Boot Loader (Key → Download → Main UI)
--- รองรับ Delta / syn / KRNL / Script-Ware / Fluxus / Solara ฯลฯ + loadstring(HttpGet)
--- จัดเต็ม: Patch Key/Download ให้ยิงสัญญาณ, Watchers หลายชั้น, Retry/Backoff, Force Main fallback
--- + เพิ่ม: FORCE_KEY_UI, Hotkey ลบคีย์แล้วรีโหลด (RightAlt), deleteState(), reloadSelf()
--- + เพิ่ม (ใหม่): Force Key First บังคับให้ Key UI แสดงก่อนเสมอ (ปรับได้ด้วย getgenv().UFO_FORCE_KEY_UI)
--- + FIX: กดปุ่ม X ใน Key UI จะไม่ไปหน้า Download อีกต่อไป (เรียก Download เฉพาะตอนคีย์ผ่าน)
+-- One-click Diagnostic & Quick-UI-Opener for UFO-HUB-X
+-- วางเป็น LocalScript ใน StarterPlayerScripts แล้ว Play -> ดู Output window
+local HttpService = game:GetService("HttpService")
+local RunService  = game:GetService("RunService")
 
---========================================================
--- Services + Compat
---========================================================
-local HttpService  = game:GetService("HttpService")
-local UIS          = game:GetService("UserInputService")
-
-local function log(s)
-    s = "[UFO-HUB-X] "..tostring(s)
-    if rconsoleprint then rconsoleprint(s.."\n") else print(s) end
+local function out(fmt, ...) 
+    local s = (fmt):format(...)
+    print("[UFO-DIAG] "..s)
 end
 
-local function http_get(url)
-    if http and http.request then
-        local ok, res = pcall(http.request, {Url=url, Method="GET"})
-        if ok and res and (res.Body or res.body) then return true, (res.Body or res.body) end
-    end
-    if syn and syn.request then
-        local ok, res = pcall(syn.request, {Url=url, Method="GET"})
-        if ok and res and (res.Body or res.body) then return true, (res.Body or res.body) end
-    end
-    local ok, body = pcall(function() return game:HttpGet(url) end)
-    if ok and body then return true, body end
-    return false, "httpget_failed"
+local function safeCall(f, ...)
+    local ok, res = pcall(f, ...)
+    return ok, res
 end
 
-local function http_get_retry(urls, tries, delay_s)
-    local list = {}
-    if type(urls)=="table" then list = urls else list = {urls} end
-    tries   = tries or 3
-    delay_s = delay_s or 0.75
-    local attempt = 0
-    for round=1, tries do
-        for _,u in ipairs(list) do
-            attempt += 1
-            log(("HTTP try #%d → %s"):format(attempt, u))
-            local ok, body = http_get(u)
-            if ok and body then return true, body, u end
-        end
-        task.wait(delay_s * round)
-    end
-    return false, "retry_failed"
+-- รายการเช็คที่สำคัญ
+out("Starting diagnostic...")
+
+-- 1) ตรวจสอบ global ฟังก์ชัน/ตัวแปรที่ระบบต้องการ
+local globals = {
+    "UFO_SaveKeyState", "UFO_StartDownload", "UFO_ShowMain",
+    "__UFO_Download_Started", "__UFO_Main_Started", "UFO_HUBX_KEY_OK",
+    "UFO_HUBX_KEY", "UFO_HUBX_KEY_EXP", "UFO_HUBX_KEY_PERM"
+}
+for _, name in ipairs(globals) do
+    local exists = (type(_G[name]) ~= "nil")
+    out("global %-24s : %s", name, exists and tostring(type(_G[name])) or "MISSING")
 end
 
-local function safe_loadstring(src, tag)
-    local f, e = loadstring(src, tag or "chunk")
-    if not f then return false, "loadstring: "..tostring(e) end
-    local ok, err = pcall(f)
-    if not ok then return false, "pcall: "..tostring(err) end
-    return true
-end
-
---========================================================
--- FS: Persist key state
---========================================================
-local DIR        = "UFOHubX"
-local STATE_FILE = DIR.."/key_state.json"
-local function ensureDir()
-    if isfolder then
-        if not isfolder(DIR) then pcall(makefolder, DIR) end
-    end
-end
-ensureDir()
-
-local function readState()
-    if not (isfile and readfile and isfile(STATE_FILE)) then return nil end
+-- 2) ตรวจสถานะไฟล์ state
+local STATE_FILE = "UFOHubX/key_state.json"
+local hasState, stateRaw, stateTbl = false, nil, nil
+if isfile and readfile and isfile(STATE_FILE) then
+    hasState = true
     local ok, data = pcall(readfile, STATE_FILE)
-    if not ok or not data or #data==0 then return nil end
-    local ok2, decoded = pcall(function() return HttpService:JSONDecode(data) end)
-    if ok2 then return decoded end
-    return nil
+    stateRaw = ok and data or ("<readfile error: "..tostring(data)..">")
+    local ok2, decoded = pcall(function() return HttpService:JSONDecode(stateRaw) end)
+    if ok2 then stateTbl = decoded end
 end
-
-local function writeState(tbl)
-    if not (writefile and HttpService and tbl) then return end
-    local ok, json = pcall(function() return HttpService:JSONEncode(tbl) end)
-    if ok then pcall(writefile, STATE_FILE, json) end
-end
-
-local function deleteState()
-    if isfile and isfile(STATE_FILE) and delfile then pcall(delfile, STATE_FILE) end
-end
-
---========================================================
--- [ADD] External key save + import
---========================================================
-local EXT_DIR      = "UFO-HUB-X-Studio"
-local EXT_KEY_FILE = EXT_DIR.."/UFO-HUB-X-key1"
-
-local function ensureExtDir()
-    if isfolder and not isfolder(EXT_DIR) then
-        pcall(makefolder, EXT_DIR)
+out("state file present : %s", tostring(hasState))
+if hasState then
+    out("state (raw) : %s", (type(stateRaw)=="string" and #stateRaw>200) and (stateRaw:sub(1,200).." ...") or tostring(stateRaw))
+    if stateTbl then
+        out("state.key = %s, permanent=%s, expires_at=%s", tostring(stateTbl.key), tostring(stateTbl.permanent), tostring(stateTbl.expires_at))
     end
 end
 
-local function saveKeyExternal(key, expires_at, permanent)
-    if not writefile then return end
-    ensureExtDir()
-    local payload = {
-        key        = tostring(key or ""),
-        permanent  = permanent and true or false,
-        expires_at = expires_at or nil,
-        saved_at   = os.time(),
-    }
-    local ok, json = pcall(function() return HttpService:JSONEncode(payload) end)
-    if ok and json and #json > 0 then
-        pcall(writefile, EXT_KEY_FILE, json)
-    else
-        local line = string.format("%s|perm=%s|exp=%s|t=%d",
-            tostring(key or ""), tostring(permanent and true or false),
-            tostring(expires_at or "nil"), os.time())
-        pcall(writefile, EXT_KEY_FILE, line)
-    end
+-- 3) ตรวจไฟล์ external ที่เราช่วยเพิ่ม
+local EXT_FILE = "UFO-HUB-X-Studio/UFO-HUB-X-key1"
+local hasExt, extRaw, extTbl = false, nil, nil
+if isfile and readfile and isfile(EXT_FILE) then
+    hasExt = true
+    local ok, data = pcall(readfile, EXT_FILE)
+    extRaw = ok and data or ("<readfile error: "..tostring(data)..">")
+    local ok2, decoded = pcall(function() return HttpService:JSONDecode(extRaw) end)
+    if ok2 then extTbl = decoded end
+end
+out("external file present: %s", tostring(hasExt))
+if hasExt then
+    out("external (raw) : %s", (type(extRaw)=="string" and #extRaw>200) and (extRaw:sub(1,200).." ...") or tostring(extRaw))
+    if extTbl then out("external.key = %s, permanent=%s, expires_at=%s", tostring(extTbl.key), tostring(extTbl.permanent), tostring(extTbl.expires_at)) end
 end
 
-local function readKeyExternal()
-    if not (isfile and readfile and isfile(EXT_KEY_FILE)) then return nil end
-    local ok, data = pcall(readfile, EXT_KEY_FILE)
-    if not ok or not data or #data == 0 then return nil end
-
-    local tryJson, decoded = pcall(function() return HttpService:JSONDecode(data) end)
-    if tryJson and type(decoded) == "table" and decoded.key then
-        return {
-            key        = tostring(decoded.key or ""),
-            permanent  = decoded.permanent and true or false,
-            expires_at = tonumber(decoded.expires_at) or nil
-        }
-    end
-
-    local line = tostring(data):gsub("%s+$","")
-    local key  = line:match("^[^|\r\n]+") or line
-    local perm = line:match("perm%s*=%s*(%w+)") or "false"
-    local exp  = line:match("exp%s*=%s*(%d+)")
-    return {
-        key        = key,
-        permanent  = (perm:lower() == "true"),
-        expires_at = exp and tonumber(exp) or nil
-    }
+-- 4) ตรวจค่า cur/valid (ถ้ามี readState function)
+local cur, valid = nil, nil
+if type(_G.UFO_HUBX_KEY) ~= "nil" then
+    out("_G.UFO_HUBX_KEY = %s", tostring(_G.UFO_HUBX_KEY))
 end
 
---========================================================
--- Config
---========================================================
-local URL_KEYS = {
+-- Try to call readState if it exists in global scope (unlikely) - otherwise we just rely on files above.
+-- Note: This LocalScript cannot access functions inside Script.lua that are not global. We already logged global state above.
+out("NOTE: This diag checks globals and file-system only. If your Script.lua defines readState locally, this diag won't call it.")
+
+-- 5) Attempt quick UI open:
+-- Priority A: call _G.UFO_ShowMain() if present
+if type(_G.UFO_ShowMain) == "function" then
+    out("Attempting to call _G.UFO_ShowMain() ...")
+    local ok, res = safeCall(function() _G.UFO_ShowMain() end)
+    out("UFO_ShowMain call: ok=%s, err=%s", tostring(ok), tostring(res))
+    out("Wait 2s to see if Main UI appears in PlayerGui...")
+    task.wait(2)
+else
+    out("_G.UFO_ShowMain() not available, will try fetching Key UI URL and running it as a test.")
+end
+
+-- 6) If _G.UFO_ShowMain not available, attempt to fetch Key UI URL from known location
+local TEST_URLS = {
     "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X/refs/heads/main/UFO%20HUB%20X%20key.lua",
-}
-local URL_DOWNLOADS = {
     "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X-2/refs/heads/main/UFO%20HUB%20X%20Download.lua",
-}
-local URL_MAINS = {
     "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X-3/refs/heads/main/UFO%20HUB%20X%20UI.lua",
 }
-
-local ALLOW_KEYS = {
-    ["JJJMAX"]                = { permanent=true,  reusable=true, expires_at=nil },
-    ["GMPANUPHONGARTPHAIRIN"] = { permanent=true,  reusable=true, expires_at=nil },
-}
-
-local FORCE_KEY_UI = false
-local ENABLE_CLEAR_HOTKEY = true
-local CLEAR_HOTKEY        = Enum.KeyCode.RightAlt
-
-local function normKey(s)
-    s = tostring(s or ""):gsub("%c",""):gsub("%s+",""):gsub("[^%w]","")
-    return string.upper(s)
-end
-
---========================================================
--- Key state helpers
---========================================================
-local function isKeyStillValid(state)
-    if not state or not state.key then return false end
-    if state.permanent == true then return true end
-    if state.expires_at and typeof(state.expires_at)=="number" then
-        if os.time() < state.expires_at then return true end
-    end
-    return false
-end
-
-local function saveKeyState(key, expires_at, permanent)
-    local st = {
-        key        = key,
-        permanent  = permanent and true or false,
-        expires_at = expires_at or nil,
-        saved_at   = os.time(),
-    }
-    writeState(st)
-end
-
---========================================================
--- Reload ตัวเอง
---========================================================
-local function reloadSelf()
-    local boot = (getgenv and getgenv().UFO_BootURL) or nil
-    if boot and #boot > 0 then
-        task.delay(0.15, function()
-            local ok, src = http_get(boot)
-            if ok then
-                local f = loadstring(src)
-                if f then pcall(f) end
-            else
-                log("reloadSelf: fetch failed, check UFO_BootURL")
-            end
-        end)
+local fetchedAny = false
+for _, u in ipairs(TEST_URLS) do
+    local ok, body = safeCall(function() return game:HttpGet(u) end)
+    if ok and body and #tostring(body) > 0 then
+        out("Fetched URL OK: %s (len=%d)", u, #tostring(body))
+        fetchedAny = true
+        -- Do not auto-run long code. Ask user to confirm if they want to run fetched source.
+        break
     else
-        log("reloadSelf: getgenv().UFO_BootURL not set.")
+        out("Fetch failed (or blocked) for: %s", u)
     end
 end
 
---========================================================
--- Global callbacks
---========================================================
-_G.UFO_SaveKeyState = function(key, expires_at, permanent)
-    log(("SaveKeyState: key=%s exp=%s perm=%s"):format(tostring(key), tostring(expires_at), tostring(permanent)))
-    saveKeyState(key, expires_at, permanent)
-    pcall(saveKeyExternal, key, expires_at, permanent) -- [ADD]
-    _G.UFO_HUBX_KEY_OK   = true
-    _G.UFO_HUBX_KEY      = key
-    _G.UFO_HUBX_KEY_EXP  = expires_at
-    _G.UFO_HUBX_KEY_PERM = permanent and true or false
+-- 7) Final guidance printed
+out("DIAGNOSTIC COMPLETE.")
+out("Summary:")
+if not type(_G.UFO_ShowMain) == "function" then
+    out("- _G.UFO_ShowMain not available? (check Script.lua running and not erroring).")
 end
-
---========================================================
--- Watchers / Hotkey
---========================================================
-local function startKeyWatcher(timeout_sec)
-    timeout_sec = timeout_sec or 120
-    task.spawn(function()
-        local t0 = os.clock()
-        while (os.clock() - t0) < timeout_sec do
-            if _G and _G.UFO_HUBX_KEY_OK then
-                log("Watcher: KEY_OK detected → start download")
-                if _G and _G.UFO_StartDownload then _G.UFO_StartDownload() end
-                return
-            end
-            task.wait(0.25)
-        end
-        log("Watcher: Key stage timeout (still waiting for user input).")
-    end)
-end
-
-local function startDownloadWatcher(timeout_sec)
-    timeout_sec = timeout_sec or 90
-    task.spawn(function()
-        local t0 = os.clock()
-        while (os.clock() - t0) < timeout_sec do
-            if _G and _G.__UFO_Main_Started then return end
-            task.wait(0.5)
-        end
-        log("Watcher: Download timeout → Force Main UI")
-        if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
-    end)
-end
-
-local function startUltimateWatchdog(total_sec)
-    total_sec = total_sec or 180
-    task.spawn(function()
-        local t0 = os.clock()
-        while (os.clock() - t0) < total_sec do
-            if _G and _G.__UFO_Main_Started then return end
-            task.wait(1)
-        end
-        log("Ultimate Watchdog: Forcing Main UI (safety).")
-        if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
-    end)
-end
-
-if ENABLE_CLEAR_HOTKEY then
-    UIS.InputBegan:Connect(function(i, gpe)
-        if gpe then return end
-        if i.KeyCode == CLEAR_HOTKEY then
-            log("Hotkey: clear key state and reload")
-            deleteState()
-            reloadSelf()
-        end
-    end)
-end
-
---========================================================
--- Boot Flow
---========================================================
-startUltimateWatchdog(180)
-
-do
-    local env = (getgenv and getgenv().UFO_FORCE_KEY_UI)
-    if env == nil then FORCE_KEY_UI = true else FORCE_KEY_UI = env and true or false end
-end
-
-local cur   = readState()
-local valid = isKeyStillValid(cur)
-
--- [ADD] ใช้คีย์จากไฟล์ภายนอกถ้า state เดิมไม่ valid
-do
-    if not valid then
-        local ext = readKeyExternal()
-        if ext and ext.key and #tostring(ext.key) > 0 then
-            local okToUse = false
-            if ext.permanent == true then okToUse = true
-            elseif ext.expires_at and typeof(ext.expires_at)=="number" and os.time() < ext.expires_at then
-                okToUse = true
-            end
-            if okToUse and _G and type(_G.UFO_SaveKeyState) == "function" then
-                _G.UFO_SaveKeyState(ext.key, ext.expires_at, ext.permanent)
-                cur   = readState()
-                valid = isKeyStillValid(cur)
-                log("Imported key from external file: " .. tostring(ext.key))
-            end
-        end
-    end
-end
-
--- ======= โหมดบังคับ Key UI =======
-if FORCE_KEY_UI then
-    -- (โค้ดเดิมสำหรับ Key UI + patch + UFO_StartDownload + UFO_ShowMain …)
-end
-
--- ======= โหมดปกติ =======
-if valid then
-    -- (โค้ดเดิมสำหรับ skip Key UI → Download …)
+if not hasState and not hasExt then
+    out("- No key_state.json and no external key file found -> Key UI will be shown.")
+elseif hasExt and not hasState then
+    out("- External key present but state file not found -> external import should run. If not, check Script.lua was loaded successfully and contains readKeyExternal + import block.")
 else
-    -- (โค้ดเดิมสำหรับ No valid key → Show Key UI …)
+    out("- Files: state=%s, external=%s", tostring(hasState), tostring(hasExt))
 end
 
--- Done boot loader
+out("")
+out("Next steps (pick one and tell me the Output lines):")
+out("A) Paste the Output log here (copy all [UFO-DIAG] lines). I'll read and tell exact fix.")
+out("B) If you want immediate quick UI test now, reply 'RUN_MAIN' and I'll give a one-line script to force-call UI (only runs locally in Studio).")
+out("C) If there are runtime errors in your Script.lua (check Output window for red errors), paste them and I'll fix the exact syntax/placement.")
+out("D) If you want I can produce a FULL Script.lua (complete, with the exact Boot Flow included + our adds) as one file for you to replace — reply 'FULL FILE' and I'll emit it (long).")
+
+-- end diag
