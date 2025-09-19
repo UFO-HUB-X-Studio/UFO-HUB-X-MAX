@@ -577,4 +577,156 @@ task.defer(function()
         print("[UFO] Fallback probe shown.")
     end
 end)
--- ==== END FORCE SHOW PATCH ====
+
+----------------------------------------------------------------
+    -- Submit flow
+    ----------------------------------------------------------------
+    local function doSubmit()
+        if submitting then return end
+        submitting = true; btnSubmit.AutoButtonColor = false; btnSubmit.Active = false
+
+        local k = keyBox.Text or ""
+        if k == "" then
+            forceErrorUI("🚫 Please enter a key", "โปรดใส่รหัสก่อนนะ"); return
+        end
+
+        setStatus("กำลังตรวจสอบคีย์...", nil)
+        tween(btnSubmit, {BackgroundColor3 = Color3.fromRGB(70,170,120)}, .08)
+        btnSubmit.Text = "⏳ Verifying..."
+
+        local valid, reason, expires_at = false, nil, nil
+        local allowed, nk, meta = isAllowedKey(k)
+        if allowed then
+            valid = true
+            expires_at = os.time() + (tonumber(meta.ttl) or DEFAULT_TTL_SECONDS)
+            print("[UFO-HUB-X] allowed key:", nk, "exp:", expires_at)
+        else
+            valid, reason, expires_at = verifyWithServer(k)
+            if valid then
+                print("[UFO-HUB-X] server verified key:", k, "exp:", expires_at)
+            else
+                print("[UFO-HUB-X] key invalid:", k, "reason:", tostring(reason))
+            end
+        end
+
+        if not valid then
+            if reason == "server_unreachable" then
+                forceErrorUI("❌ Invalid Key", "เชื่อมต่อเซิร์ฟเวอร์ไม่ได้ ลองใหม่หรือตรวจเน็ต")
+            else
+                forceErrorUI("❌ Invalid Key", "กุญแจไม่ถูกต้อง ลองอีกครั้ง")
+            end
+            return
+        end
+
+        -- ผ่าน ✅
+        tween(btnSubmit, {BackgroundColor3 = Color3.fromRGB(120,255,170)}, .10)
+        btnSubmit.Text = "✅ Key accepted"
+        btnSubmit.TextColor3 = Color3.new(0,0,0)
+        setStatus("ยืนยันคีย์สำเร็จ พร้อมใช้งาน!", true)
+        showToast("ยืนยันสำเร็จ", true)
+
+        _G.UFO_HUBX_KEY_OK = true
+        _G.UFO_HUBX_KEY    = k
+
+        if _G.UFO_SaveKeyState and expires_at then
+            pcall(_G.UFO_SaveKeyState, k, tonumber(expires_at) or (os.time()+DEFAULT_TTL_SECONDS), false)
+        end
+
+        task.delay(0.15, function()
+            fadeOutAndDestroy()
+        end)
+    end
+    btnSubmit.MouseButton1Click:Connect(doSubmit)
+    btnSubmit.Activated:Connect(doSubmit)
+
+    -------------------- GET KEY (ลิงก์พร้อม uid/compat place) --------------------
+    local btnGetKey = make("TextButton", {
+        Parent=panel, Text="🔐  Get Key", Font=Enum.Font.GothamBold, TextSize=18,
+        TextColor3=Color3.new(1,1,1), AutoButtonColor=false,
+        BackgroundColor3=SUB, BorderSizePixel=0,
+        Size=UDim2.new(1,-56,0,44), Position=UDim2.new(0,28,0,324)
+    },{
+        make("UICorner",{CornerRadius=UDim.new(0,14)}),
+        make("UIStroke",{Color=ACCENT, Transparency=0.6})
+    })
+    btnGetKey.MouseButton1Click:Connect(function()
+        local url = copyGetKeyUrl()
+        btnGetKey.Text = "✅ Link copied!"
+        task.delay(1.5,function() btnGetKey.Text="🔐  Get Key" end)
+    end)
+
+    -------------------- SUPPORT --------------------
+    local supportRow = make("Frame", {
+        Parent=panel, AnchorPoint = Vector2.new(0.5,1),
+        Position = UDim2.new(0.5,0,1,-18), Size = UDim2.new(1,-56,0,24),
+        BackgroundTransparency = 1
+    }, {})
+    make("UIListLayout", {
+        Parent = supportRow, FillDirection = Enum.FillDirection.HORIZONTAL,
+        HorizontalAlignment = Enum.HorizontalAlignment.Center,
+        VerticalAlignment   = Enum.VerticalAlignment.Center,
+        SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0,6)
+    }, {})
+    make("TextLabel", {
+        Parent=supportRow, LayoutOrder=1, BackgroundTransparency=1,
+        Font=Enum.Font.Gotham, TextSize=16, Text="Need support?",
+        TextColor3=Color3.fromRGB(200,200,200), AutomaticSize=Enum.AutomaticSize.X
+    }, {})
+    local btnDiscord = make("TextButton", {
+        Parent=supportRow, LayoutOrder=2, BackgroundTransparency=1,
+        Font=Enum.Font.GothamBold, TextSize=16, Text="Join the Discord",
+        TextColor3=ACCENT, AutomaticSize=Enum.AutomaticSize.X
+    },{})
+    btnDiscord.MouseButton1Click:Connect(function()
+        setClipboard(DISCORD_URL)
+        btnDiscord.Text = "✅ Link copied!"
+        task.delay(1.5,function() btnDiscord.Text="Join the Discord" end)
+    end)
+
+    -------------------- Open Animation --------------------
+    panel.Position = UDim2.fromScale(0.5,0.5) + UDim2.fromOffset(0,14)
+    tween(panel, {Position = UDim2.fromScale(0.5,0.5)}, .18)
+end -- _ufo_boot()
+
+-- บูต UI แบบกันพัง: ถ้าพังก็ใส่ fallback ปุ่มคัดลอกลิงก์ Get Key ให้
+local ok_boot, err_boot = pcall(_ufo_boot)
+if not ok_boot then
+    warn("[UFO-HUB-X] UI boot error: ", err_boot)
+    pcall(function()
+        local gui = Instance.new("ScreenGui")
+        gui.Name = "UFOHubX_KeyUI_Fallback"
+        gui.IgnoreGuiInset = true
+        gui.ResetOnSpawn = false
+        safeParent(gui)
+
+        local f = make("Frame", {
+            Parent=gui, Size=UDim2.fromOffset(360,120),
+            AnchorPoint=Vector2.new(0.5,0.5), Position=UDim2.fromScale(0.5,0.5),
+            BackgroundColor3=BG_DARK, BorderSizePixel=0
+        },{
+            make("UICorner",{CornerRadius=UDim.new(0,16)}),
+            make("UIStroke",{Color=ACCENT, Transparency=0.6})
+        })
+        make("TextLabel", {
+            Parent=f, BackgroundTransparency=1, Position=UDim2.new(0,16,0,14),
+            Size=UDim2.new(1,-32,0,42), Font=Enum.Font.GothamBold, TextSize=16,
+            Text="Key UI โหลดไม่สำเร็จ\nกดปุ่มด้านล่างเพื่อคัดลอกลิงก์ Get Key",
+            TextWrapped=true, TextColor3=FG
+        },{})
+        local b = make("TextButton", {
+            Parent=f, Text="🔐  Copy Get Key Link", Font=Enum.Font.GothamBold, TextSize=16,
+            TextColor3=Color3.new(1,1,1), AutoButtonColor=false,
+            BackgroundColor3=SUB, BorderSizePixel=0,
+            Size=UDim2.new(1,-32,0,38), Position=UDim2.new(0,16,1,-54)
+        },{
+            make("UICorner",{CornerRadius=UDim.new(0,10)}),
+            make("UIStroke",{Color=ACCENT, Transparency=0.6})
+        })
+        b.MouseButton1Click:Connect(function()
+            local url = copyGetKeyUrl()
+            setClipboard(url)
+            b.Text = "✅ Copied!"
+            task.delay(1.4,function() b.Text = "🔐  Copy Get Key Link" end)
+        end)
+    end)
+end
