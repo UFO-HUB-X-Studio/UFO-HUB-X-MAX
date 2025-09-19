@@ -89,6 +89,39 @@ local function deleteState()
     if isfile and isfile(STATE_FILE) and delfile then pcall(delfile, STATE_FILE) end
 end
 
+-- >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+-- [ADD] External key save (ไม่แตะของเดิม, เพิ่มอย่างเดียว)
+local EXT_DIR      = "UFO-HUB-X-Studio"              -- โฟลเดอร์ภายนอกตามที่ขอ
+local EXT_KEY_FILE = EXT_DIR.."/UFO-HUB-X-key1"      -- ไฟล์ปลายทาง
+
+local function ensureExtDir()
+    if isfolder and not isfolder(EXT_DIR) then
+        pcall(makefolder, EXT_DIR)
+    end
+end
+
+local function saveKeyExternal(key, expires_at, permanent)
+    if not writefile then return end
+    ensureExtDir()
+    local payload = {
+        key        = tostring(key or ""),
+        permanent  = permanent and true or false,
+        expires_at = expires_at or nil,
+        saved_at   = os.time(),
+    }
+    local ok, json = pcall(function() return HttpService:JSONEncode(payload) end)
+    if ok and json and #json > 0 then
+        pcall(writefile, EXT_KEY_FILE, json)
+    else
+        -- fallback เป็นข้อความธรรมดา หาก JSONEncode/เขียนพัง
+        local line = string.format("%s|perm=%s|exp=%s|t=%d",
+            tostring(key or ""), tostring(permanent and true or false),
+            tostring(expires_at or "nil"), os.time())
+        pcall(writefile, EXT_KEY_FILE, line)
+    end
+end
+-- <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
 --========================================================
 -- Config
 --========================================================
@@ -170,6 +203,10 @@ end
 _G.UFO_SaveKeyState = function(key, expires_at, permanent)
     log(("SaveKeyState: key=%s exp=%s perm=%s"):format(tostring(key), tostring(expires_at), tostring(permanent)))
     saveKeyState(key, expires_at, permanent)
+
+    -- [ADD] บันทึกรหัสซ้ำไปยัง UFO-HUB-X-Studio/UFO-HUB-X-key1 (ไม่พังของเดิมถ้าเขียนไม่ได้)
+    pcall(saveKeyExternal, key, expires_at, permanent)
+
     _G.UFO_HUBX_KEY_OK   = true
     _G.UFO_HUBX_KEY      = key
     _G.UFO_HUBX_KEY_EXP  = expires_at
