@@ -1,10 +1,11 @@
 --========================================================
--- UFO HUB X — KEY UI (v18+, full drop-in, +simple helpers like old flow)
--- - API JSON: /verify?key=&uid=&place=  และ  /getkey
+-- UFO HUB X — KEY UI (v18+, full drop-in, UNIVERSAL KEY)
+-- - API JSON: /verify?key=&uid=   และ   /getkey?uid=
+-- - ไม่ผูกกับ place (ใช้ uid อย่างเดียว) ใช้ได้ทุกแผนที่
 -- - จำอายุคีย์ผ่าน _G.UFO_SaveKeyState (48 ชม. หรือ expires_at จาก server)
--- - ปุ่ม Get Key คัดลอกลิงก์พร้อม uid/place (ฐาน = SERVER_BASES[1])
+-- - ปุ่ม Get Key คัดลอกลิงก์พร้อม uid (ฐาน = SERVER_BASES[1])
 -- - รองรับหลายเซิร์ฟเวอร์ (failover & retry)
--- - เพิ่ม verifyKey()/copyGetKeyUrl() แบบ “อันเก่า” เรียกง่ายจากที่ไหนก็ได้
+-- - มี verifyKey()/copyGetKeyUrl() แบบ “อันเก่า” ให้เรียกง่าย
 -- - Fade-out แล้ว Destroy เมื่อสำเร็จ
 --========================================================
 
@@ -27,13 +28,13 @@ local GREEN     = Color3.fromRGB(60,200,120)
 -------------------- LINKS --------------------
 local DISCORD_URL = "https://discord.gg/your-server"
 
--- ใส่ URL เซิร์ฟเวอร์ของคุณ (ลำดับตามความสำคัญ) — จะหมุนสำรองอัตโนมัติ
+-- URL เซิร์ฟเวอร์ (ลำดับความสำคัญ)
 local SERVER_BASES = {
-    "https://ufo-hub-x-key-umoq.onrender.com",         -- ตัวหลัก (ใช้กับปุ่ม Get Key และ simple verify)
-    -- "https://ufo-hub-x-server-key2.onrender.com",   -- ตัวสำรอง (ถ้ามี)
+    "https://ufo-hub-x-key-umoq.onrender.com",         -- หลัก
+    -- "https://ufo-hub-x-server-key2.onrender.com",   -- สำรอง (ถ้ามี)
 }
 
--- อายุคีย์เริ่มต้น (กรณี allow-list ภายในไฟล์นี้)
+-- อายุคีย์เริ่มต้น
 local DEFAULT_TTL_SECONDS = 48 * 3600 -- 48 ชั่วโมง
 
 ----------------------------------------------------------------
@@ -103,16 +104,14 @@ local function isAllowedKey(k)
 end
 
 ----------------------------------------------------------------
--- ตรวจคีย์กับ Server (JSON — โหมดทน)
--- server ตอบ: { ok:true, valid:true/false, expires_at:<unix>, reason:"..." }
+-- ตรวจคีย์กับ Server (UNIVERSAL: ผูกกับ uid ไม่ผูก place)
+-- server ตอบ JSON: { ok:true, valid:true/false, expires_at:<unix>, reason:"..." }
 ----------------------------------------------------------------
 local function verifyWithServer(k)
-    local uid   = tostring(LP and LP.UserId or "")
-    local place = tostring(game.PlaceId or "")
-    local qs = string.format("/verify?key=%s&uid=%s&place=%s",
+    local uid = tostring(LP and LP.UserId or "")
+    local qs = string.format("/verify?key=%s&uid=%s&format=json",
         HttpService:UrlEncode(k),
-        HttpService:UrlEncode(uid),
-        HttpService:UrlEncode(place)
+        HttpService:UrlEncode(uid)
     )
     local ok, data = json_get_with_failover(qs)
     if not ok or not data then
@@ -131,13 +130,11 @@ end
 -- ใช้ SERVER_BASES[1] เป็นฐานหลัก
 ----------------------------------------------------------------
 local function getKeyUrlForCurrentPlayer()
-    local uid   = tostring(LP and LP.UserId or "")
-    local place = tostring(game.PlaceId or "")
-    local base  = SERVER_BASES[1] or "https://ufo-hub-x-key-umoq.onrender.com"
-    return string.format("%s/getkey?uid=%s&place=%s",
+    local uid  = tostring(LP and LP.UserId or "")
+    local base = SERVER_BASES[1] or "https://ufo-hub-x-key-umoq.onrender.com"
+    return string.format("%s/getkey?uid=%s",
         base,
-        HttpService:UrlEncode(uid),
-        HttpService:UrlEncode(place)
+        HttpService:UrlEncode(uid)
     )
 end
 
@@ -148,18 +145,15 @@ local function copyGetKeyUrl()
     return url
 end
 
--- ตรวจคีย์แบบเก่า: เรียก /verify แล้วเช็คคำว่า "VALID"
--- ใช้สะดวกจากที่ไหนก็ได้ในเกมของคุณ
+-- ตรวจคีย์แบบเก่า: เรียก /verify แล้วเช็คคำว่า "VALID" (UNIVERSAL: ไม่ส่ง place)
 local function verifyKey(inputKey)
-    local uid   = tostring(LP and LP.UserId or "")
-    local place = tostring(game.PlaceId or "")
-    local base  = SERVER_BASES[1] or "https://ufo-hub-x-key-umoq.onrender.com"
+    local uid  = tostring(LP and LP.UserId or "")
+    local base = SERVER_BASES[1] or "https://ufo-hub-x-key-umoq.onrender.com"
 
-    local url = string.format("%s/verify?key=%s&uid=%s&place=%s",
+    local url = string.format("%s/verify?key=%s&uid=%s",
         base,
         HttpService:UrlEncode(tostring(inputKey or "")),
-        HttpService:UrlEncode(uid),
-        HttpService:UrlEncode(place)
+        HttpService:UrlEncode(uid)
     )
 
     local ok, body = pcall(function() return game:HttpGet(url) end)
@@ -442,8 +436,7 @@ local function doSubmit()
         expires_at = os.time() + (tonumber(meta.ttl) or DEFAULT_TTL_SECONDS)
         print("[UFO-HUB-X] allowed key:", nk, "exp:", expires_at)
     else
-        valid, reason, expires_at = verifyWithServer(k) -- โหมดทน
-        -- (ถ้าอยากบังคับใช้แบบเก่าแทน ให้สลับมาใช้: valid = verifyKey(k); expires_at = os.time()+DEFAULT_TTL_SECONDS )
+        valid, reason, expires_at = verifyWithServer(k) -- โหมดทน (UNIVERSAL)
         if valid then
             print("[UFO-HUB-X] server verified key:", k, "exp:", expires_at)
         else
@@ -481,7 +474,7 @@ end
 btnSubmit.MouseButton1Click:Connect(doSubmit)
 btnSubmit.Activated:Connect(doSubmit)
 
--------------------- GET KEY (ลิงก์พร้อม uid/place) --------------------
+-------------------- GET KEY (ลิงก์พร้อม uid) --------------------
 local btnGetKey = make("TextButton", {
     Parent=panel, Text="🔐  Get Key", Font=Enum.Font.GothamBold, TextSize=18,
     TextColor3=Color3.new(1,1,1), AutoButtonColor=false,
@@ -492,7 +485,7 @@ local btnGetKey = make("TextButton", {
     make("UIStroke",{Color=ACCENT, Transparency=0.6})
 })
 btnGetKey.MouseButton1Click:Connect(function()
-    local url = copyGetKeyUrl() -- แบบเก่า: คัดลอกลิงก์จาก SERVER_BASES[1]
+    local url = copyGetKeyUrl() -- คัดลอกลิงก์จาก SERVER_BASES[1]
     btnGetKey.Text = "✅ Link copied!"
     task.delay(1.5,function() btnGetKey.Text="🔐  Get Key" end)
 end)
