@@ -1,158 +1,222 @@
--- === [UFO HUB X • Boot Loader: Key → Download → Main] ======================
--- Single-run guard (กันซ้ำ)
-if getgenv and getgenv().__UFO_BOOT_RUNNING then return end
-if getgenv then getgenv().__UFO_BOOT_RUNNING = true end
+--========================================================
+-- UFO HUB X — KeyGate (ไฟล์เดียวจบ)
+-- - เปิดด้วย loadstring(...)() หรือวางในตัวรัน Delta ก็ได้
+-- - ถ้ามีคีย์ที่ยังไม่หมดอายุ => ข้าม UI คีย์ ไป Download -> HUB
+-- - ถ้าไม่มี/หมดอายุ => ขึ้น UI คีย์ กดตรวจแล้วบันทึกอายุคีย์
+--========================================================
 
--- ★ ตั้งลิงก์ของคุณที่นี่ (แก้เป็นของตัวเองได้)
-local URL_KEYS = {
-  "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X/refs/heads/main/UFO%20HUB%20X%20key.lua",
-}
-local URL_DOWNLOADS = {
-  "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X-2/refs/heads/main/UFO%20HUB%20X%20Download.lua",
-}
-local URL_MAINS = {
-  "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X-3/refs/heads/main/UFO%20HUB%20X%20UI.lua",
-}
+-------------------- CONFIG --------------------
+local SERVER_BASE  = "https://ufo-hub-x-key-umoq.onrender.com"  -- <<<< แก้เป็นของคุณ
+local DOWNLOAD_URL = "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X-2/refs/heads/main/UFO%20HUB%20X%20Download.lua"
+local HUB_URL      = "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X/refs/heads/main/UFO%20HUB%20X.lua"
+local STATE_FILE   = "ufo_hubx_state.json"   -- ต้องใช้ executor ที่รองรับ writefile/readfile
 
--- ===== ไม่ต้องแก้ด้านล่างนี้ =====
-local HttpService  = game:GetService("HttpService")
-local UIS          = game:GetService("UserInputService")
+-------------------- Services --------------------
+local Players     = game:GetService("Players")
+local CoreGui     = game:GetService("CoreGui")
+local TweenService= game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+local LP          = Players.LocalPlayer
 
-local function log(s) s="[UFO-HUB-X] "..tostring(s); if rconsoleprint then rconsoleprint(s.."\n") else print(s) end end
-local function http_get(u)
-  if http and http.request then local ok,r=pcall(http.request,{Url=u,Method="GET"}); if ok and r and (r.Body or r.body) then return true,(r.Body or r.body) end end
-  if syn and syn.request then local ok,r=pcall(syn.request,{Url=u,Method="GET"}); if ok and r and (r.Body or r.body) then return true,(r.Body or r.body) end end
-  local ok,b=pcall(function() return game:HttpGet(u) end); if ok and b then return true,b end
-  return false,"httpget_failed"
+-------------------- State (persist) --------------------
+local function read_state()
+    if not isfile or not readfile then return _G.__UFO_STATE end
+    if not isfile(STATE_FILE) then return _G.__UFO_STATE end
+    local ok, data = pcall(readfile, STATE_FILE)
+    if not ok or not data or #data==0 then return _G.__UFO_STATE end
+    local okj, obj = pcall(function() return HttpService:JSONDecode(data) end)
+    if okj then _G.__UFO_STATE = obj return obj end
+    return _G.__UFO_STATE
 end
-local function http_get_retry(urls, tries, delay_s)
-  local list = (type(urls)=="table") and urls or {urls}; tries = tries or 3; delay_s = delay_s or 0.75
-  local attempt=0
-  for round=1,tries do
-    for _,u in ipairs(list) do
-      attempt+=1; log(("HTTP try #%d → %s"):format(attempt,u))
-      local ok,body=http_get(u); if ok and body then return true,body,u end
+
+local function write_state(obj)
+    _G.__UFO_STATE = obj
+    if writefile then pcall(writefile, STATE_FILE, HttpService:JSONEncode(obj or {})) end
+end
+
+local function clear_state()
+    _G.__UFO_STATE = nil
+    if delfile and isfile and isfile(STATE_FILE) then pcall(delfile, STATE_FILE) end
+end
+
+_G.UFO_SaveKeyState = function(key, expires_at)
+    write_state({ key = tostring(key or ""), exp = tonumber(expires_at) or (os.time()+172800) })
+end
+
+-------------------- Server verify --------------------
+_G.UFO_VerifyKeyWithServer = function(inputKey)
+    local uid = tostring(LP and LP.UserId or "")
+    local url = string.format("%s/verify?key=%s&uid=%s",
+        SERVER_BASE,
+        HttpService:UrlEncode(tostring(inputKey or "")),
+        HttpService:UrlEncode(uid)
+    )
+    local ok, body = pcall(function() return game:HttpGet(url) end)
+    if not ok or not body then return false, "server_unreachable" end
+    local okj, data = pcall(function() return HttpService:JSONDecode(body) end)
+    if not okj then return false, "json_error" end
+    if data and data.valid then
+        local exp = tonumber(data.expires_at) or (os.time()+172800)
+        _G.UFO_SaveKeyState(inputKey, exp)
+        return true, exp
+    else
+        return false, tostring(data and data.reason or "invalid")
     end
-    task.wait(delay_s*round)
-  end
-  return false,"retry_failed"
-end
-local function safe_loadstring(src, tag)
-  local f,e=loadstring(src,tag or "chunk"); if not f then return false,"loadstring: "..tostring(e) end
-  local ok,err=pcall(f); if not ok then return false,"pcall: "..tostring(err) end
-  return true
 end
 
--- === บันทึกสถานะคีย์ในไฟล์ (หมดอายุแล้วเด้ง UI เอง) =====================
-local DIR, STATE_FILE = "UFOHubX", "UFOHubX/key_state.json"
-local function ensureDir() if isfolder and not isfolder(DIR) then pcall(makefolder,DIR) end end
-ensureDir()
-local function readState()
-  if not (isfile and readfile and isfile(STATE_FILE)) then return nil end
-  local ok,d=pcall(readfile,STATE_FILE); if not ok or not d or #d==0 then return nil end
-  local ok2,js=pcall(function() return HttpService:JSONDecode(d) end); if ok2 then return js end
-  return nil
-end
-local function writeState(t)
-  if not (writefile and t) then return end
-  local ok,j=pcall(function() return HttpService:JSONEncode(t) end); if ok then pcall(writefile,STATE_FILE,j) end
-end
-local function deleteState() if isfile and isfile(STATE_FILE) and delfile then pcall(delfile,STATE_FILE) end end
-local function isKeyStillValid(st)
-  if not st or not st.key then return false end
-  if st.permanent==true then return true end
-  if st.expires_at and typeof(st.expires_at)=="number" then return os.time() < st.expires_at end
-  return false
-end
-local function saveKeyState(key, expires_at, permanent)
-  writeState({ key=key, permanent=permanent and true or false, expires_at=expires_at or nil, saved_at=os.time() })
+-------------------- Flow: ไปหน้าถัดไป (Download -> HUB) --------------------
+_G.UFO_GoNext = function()
+    -- ปิด UI คีย์ถ้ายังอยู่
+    local g = CoreGui:FindFirstChild("UFOHubX_KeyUI")
+    if g then pcall(function() g:Destroy() end) end
+
+    -- เปิด Download UI
+    pcall(function()
+        loadstring(game:HttpGet(DOWNLOAD_URL))()
+    end)
+
+    -- หน่วงสั้นๆ แล้วเปิด HUB (Download UI จะ destroy ตัวเองตอนครบ 100%)
+    task.delay(0.4, function()
+        pcall(function()
+            loadstring(game:HttpGet(HUB_URL))()
+        end)
+    end)
 end
 
--- === ปุ่มลัดลบคีย์แล้วรีโหลด (RightAlt) ====================================
-local ENABLE_CLEAR_HOTKEY, CLEAR_HOTKEY = true, Enum.KeyCode.RightAlt
-local function reloadSelf()
-  local boot = (getgenv and getgenv().UFO_BootURL) or nil
-  if not boot then log("reloadSelf: set getgenv().UFO_BootURL ก่อน"); return end
-  task.delay(0.15,function() local ok,src=http_get(boot); if ok then local f=loadstring(src); if f then pcall(f) end end end)
-end
-if ENABLE_CLEAR_HOTKEY then
-  UIS.InputBegan:Connect(function(i,g) if g then return end; if i.KeyCode==CLEAR_HOTKEY then log("Hotkey: clear & reload"); deleteState(); reloadSelf() end end)
+-------------------- UI คีย์ (เรียบง่าย ก๊อปวางจบ) --------------------
+local function safeParent(gui)
+    local ok=false
+    if syn and syn.protect_gui then pcall(function() syn.protect_gui(gui) end) end
+    if gethui then ok = pcall(function() gui.Parent = gethui() end) end
+    if not ok then gui.Parent = CoreGui end
 end
 
--- === Callbacks ที่ UI ยิงกลับมา ============================================
-_G.UFO_SaveKeyState = function(key, expires_at, permanent)
-  log(("SaveKeyState: %s exp=%s perm=%s"):format(tostring(key),tostring(expires_at),tostring(permanent)))
-  saveKeyState(key, expires_at, permanent)
-  _G.UFO_HUBX_KEY_OK   = true
-  _G.UFO_HUBX_KEY      = key
-  _G.UFO_HUBX_KEY_EXP  = expires_at
-  _G.UFO_HUBX_KEY_PERM = permanent and true or false
+local function make(class, props, kids)
+    local o = Instance.new(class)
+    for k,v in pairs(props or {}) do o[k]=v end
+    for _,c in ipairs(kids or {}) do c.Parent=o end
+    return o
 end
 
-_G.UFO_StartDownload = function()
-  if _G.__UFO_Download_Started then return end
-  _G.__UFO_Download_Started = true
-  log("Start Download UI")
-  local ok,src=http_get_retry(URL_DOWNLOADS,5,0.8)
-  if not ok then log("Download fail → Force Main"); if _G.UFO_ShowMain then _G.UFO_ShowMain() end; return end
-  -- บังคับให้จบแล้วไป Main เสมอ
-  local patched, n = src:gsub("gui:Destroy%(%);?","if _G.UFO_ShowMain then _G.UFO_ShowMain() end\ngui:Destroy();")
-  if n>0 then src=patched end
-  local ok2,err=safe_loadstring(src,"UFOHubX_Download"); if not ok2 then log("Download run err: "..tostring(err)); if _G.UFO_ShowMain then _G.UFO_ShowMain() end end
+local function tween(o, goal, t)
+    TweenService:Create(o, TweenInfo.new(t or .18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), goal):Play()
 end
 
-_G.UFO_ShowMain = function()
-  if _G.__UFO_Main_Started then return end
-  _G.__UFO_Main_Started = true
-  log("Show Main UI")
-  local ok,src=http_get_retry(URL_MAINS,5,0.8); if not ok then log("Main fetch failed"); return end
-  local ok2,err=safe_loadstring(src,"UFOHubX_Main"); if not ok2 then log("Main run err: "..tostring(err)) end
+local function show_key_ui()
+    local ACCENT=Color3.fromRGB(0,255,140)
+    local BG    = Color3.fromRGB(12,12,12)
+    local SUB   = Color3.fromRGB(24,24,24)
+    local FG    = Color3.fromRGB(235,235,235)
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name="UFOHubX_KeyUI"; gui.IgnoreGuiInset=true; gui.ResetOnSpawn=false; gui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
+    safeParent(gui)
+
+    local panel = make("Frame", {
+        Parent=gui, Active=true, Draggable=true, BackgroundColor3=BG, BorderSizePixel=0,
+        Size=UDim2.fromOffset(680, 360), AnchorPoint=Vector2.new(0.5,0.5), Position=UDim2.fromScale(0.5,0.5)
+    }, {
+        make("UICorner",{CornerRadius=UDim.new(0,20)}),
+        make("UIStroke",{Color=ACCENT, Transparency=0.1, Thickness=2})
+    })
+
+    local title = make("TextLabel", {
+        Parent=panel, BackgroundTransparency=1, Position=UDim2.new(0,24,0,22), Size=UDim2.new(1,-48,0,36),
+        Font=Enum.Font.GothamBlack, TextSize=26, Text="UFO HUB X — KEY", TextColor3=FG, TextXAlignment=Enum.TextXAlignment.Left
+    })
+
+    local keyLabel = make("TextLabel", {
+        Parent=panel, BackgroundTransparency=1, Position=UDim2.new(0,24,0,96), Size=UDim2.new(0,60,0,24),
+        Font=Enum.Font.Gotham, TextSize=16, Text="Key", TextColor3=Color3.fromRGB(200,200,200), TextXAlignment=Enum.TextXAlignment.Left
+    })
+
+    local keyStroke
+    local keyBox = make("TextBox", {
+        Parent=panel, ClearTextOnFocus=false, PlaceholderText="ใส่คีย์ของคุณที่นี่",
+        Font=Enum.Font.Gotham, TextSize=16, Text="", TextColor3=FG,
+        BackgroundColor3=SUB, BorderSizePixel=0,
+        Position=UDim2.new(0,24,0,124), Size=UDim2.new(1,-48,0,40)
+    }, {
+        make("UICorner",{CornerRadius=UDim.new(0,12)}),
+        (function() keyStroke = make("UIStroke",{Color=ACCENT, Transparency=0.65}); return keyStroke end)()
+    })
+
+    local status = make("TextLabel", {
+        Parent=panel, BackgroundTransparency=1, Position=UDim2.new(0,24,0,172), Size=UDim2.new(1,-48,0,22),
+        Font=Enum.Font.Gotham, TextSize=14, Text="", TextColor3=Color3.fromRGB(200,200,200),
+        TextXAlignment=Enum.TextXAlignment.Left
+    })
+
+    local btn = make("TextButton", {
+        Parent=panel, Text="🔒  Submit Key", Font=Enum.Font.GothamBlack, TextSize=20,
+        TextColor3=Color3.new(1,1,1), AutoButtonColor=false,
+        BackgroundColor3=Color3.fromRGB(210,60,60), BorderSizePixel=0,
+        Position=UDim2.new(0,24,0,210), Size=UDim2.new(1,-48,0,50)
+    }, {
+        make("UICorner",{CornerRadius=UDim.new(0,14)})
+    })
+
+    local submitting=false
+    local function setStatus(txt, good)
+        status.Text = txt or ""
+        if good==nil then status.TextColor3 = Color3.fromRGB(200,200,200)
+        elseif good then status.TextColor3 = Color3.fromRGB(120,255,170)
+        else status.TextColor3 = Color3.fromRGB(255,120,120) end
+    end
+
+    local function flashErr()
+        local old = keyStroke.Color
+        tween(keyStroke, {Color = Color3.fromRGB(255,90,90), Transparency=0}, .05)
+        task.delay(.22, function() tween(keyStroke, {Color=old, Transparency=0.65}, .12) end)
+    end
+
+    local function doSubmit()
+        if submitting then return end
+        submitting=true; btn.Active=false
+        local k = keyBox.Text or ""
+        if k=="" then
+            setStatus("โปรดใส่คีย์ก่อน", false)
+            flashErr(); submitting=false; btn.Active=true; return
+        end
+        btn.Text="⏳ Verifying..."; tween(btn,{BackgroundColor3=Color3.fromRGB(70,170,120)},.08)
+        setStatus("กำลังตรวจสอบคีย์...", nil)
+
+        local ok, expOrReason = _G.UFO_VerifyKeyWithServer(k)
+        if ok then
+            setStatus("ยืนยันสำเร็จ! เปิดหน้าถัดไป...", true)
+            btn.Text="✅ Key accepted"
+            tween(btn,{BackgroundColor3=Color3.fromRGB(120,255,170)},.10)
+            task.delay(0.15, function()
+                _G.UFO_GoNext()
+            end)
+        else
+            setStatus((expOrReason=="expired" and "คีย์หมดอายุแล้ว") or "คีย์ไม่ถูกต้อง/ต่อเซิร์ฟเวอร์ไม่ได้", false)
+            btn.Text="🔒  Submit Key"
+            tween(btn,{BackgroundColor3=Color3.fromRGB(210,60,60)},.10)
+            flashErr()
+            submitting=false; btn.Active=true
+        end
+    end
+
+    btn.MouseButton1Click:Connect(doSubmit)
+    keyBox.FocusLost:Connect(function(enter) if enter then doSubmit() end end)
 end
 
--- === Watchers & Safe fallback ==============================================
-local function startKeyWatcher(t) t=t or 120; task.spawn(function() local t0=os.clock(); while os.clock()-t0<t do if _G.UFO_HUBX_KEY_OK then log("KEY_OK → start download"); if _G.UFO_StartDownload then _G.UFO_StartDownload() end; return end; task.wait(0.25) end end) end
-local function startDownloadWatcher(t) t=t or 90; task.spawn(function() local t0=os.clock(); while os.clock()-t0<t do if _G.__UFO_Main_Started then return end; task.wait(0.5) end; log("Download timeout → Force Main"); if _G.UFO_ShowMain then _G.UFO_ShowMain() end end) end
-task.spawn(function() local t0=os.clock(); while os.clock()-t0<180 do if _G.__UFO_Main_Started then return end; task.wait(1) end; log("Ultimate watchdog → Force Main"); if _G.UFO_ShowMain then _G.UFO_ShowMain() end end)
-
--- === ตัดสินใจโชว์อะไร =======================================================
--- ค่าเริ่มต้น: บังคับโชว์ Key ก่อน (อยากให้ข้ามเมื่อคีย์ยังไม่หมดอายุ → ตั้ง getgenv().UFO_FORCE_KEY_UI=false ก่อนรัน)
-local FORCE_KEY_UI = true
+-------------------- GATE (ตรวจ state ก่อน) --------------------
 do
-  local env = (getgenv and getgenv().UFO_FORCE_KEY_UI)
-  if env ~= nil then FORCE_KEY_UI = env and true or false end
+    local st = read_state()
+    local now = os.time()
+    if st and st.key and st.exp and now < st.exp then
+        -- ยังไม่หมดอายุ => ข้าม UI คีย์
+        _G.UFO_HUBX_KEY_OK = true
+        _G.UFO_HUBX_KEY    = st.key
+        _G.UFO_GoNext()
+        return
+    elseif st and st.exp and now >= st.exp then
+        -- หมดอายุ => ล้าง แล้วแสดง UI คีย์ใหม่
+        clear_state()
+    end
 end
 
-local state = readState()
-local valid = isKeyStillValid(state)
-
-if FORCE_KEY_UI then
-  log("FORCE_KEY_UI=true → แสดง Key UI ก่อนเสมอ")
-  startKeyWatcher(120); startDownloadWatcher(120)
-  local ok,src=http_get_retry(URL_KEYS,5,0.8); if not ok then log("Key UI fetch failed"); return end
-  -- ให้ไป Download เฉพาะตอนคีย์ผ่านจริง
-  local patched, n = src:gsub("gui:Destroy%(%);?","if _G.UFO_HUBX_KEY_OK and _G.UFO_StartDownload then _G.UFO_StartDownload() end\ngui:Destroy();")
-  if n==0 then patched, n = src:gsub('btnSubmit.Text%s*=%s*"✅ Key accepted"','btnSubmit.Text="✅ Key accepted"\nif _G.UFO_StartDownload then _G.UFO_StartDownload() end'); end
-  if n>0 then src=patched end
-  local ok2,err=safe_loadstring(src,"UFOHubX_Key"); if not ok2 then log("Key UI run err: "..tostring(err)) end
-  return
-end
-
-if valid then
-  log("Key valid → ข้าม Key UI → ไป Download")
-  _G.UFO_HUBX_KEY_OK=true; _G.UFO_HUBX_KEY=state.key; _G.UFO_HUBX_KEY_EXP=state.expires_at; _G.UFO_HUBX_KEY_PERM=state.permanent==true
-  startDownloadWatcher(90)
-  local ok,src=http_get_retry(URL_DOWNLOADS,5,0.8)
-  if not ok then log("Download fetch fail → Force Main"); if _G.UFO_ShowMain then _G.UFO_ShowMain() end; return end
-  local patched, n = src:gsub("gui:Destroy%(%);?","if _G.UFO_ShowMain then _G.UFO_ShowMain() end\ngui:Destroy();")
-  if n>0 then src=patched end
-  local ok2,err=safe_loadstring(src,"UFOHubX_Download"); if not ok2 then log("Download run err: "..tostring(err)); if _G.UFO_ShowMain then _G.UFO_ShowMain() end end
-else
-  log("ไม่มีคีย์ที่ยังไม่หมดอายุ → แสดง Key UI")
-  startKeyWatcher(120); startDownloadWatcher(120)
-  local ok,src=http_get_retry(URL_KEYS,5,0.8); if not ok then log("Key UI fetch failed"); return end
-  local patched, n = src:gsub("gui:Destroy%(%);?","if _G.UFO_HUBX_KEY_OK and _G.UFO_StartDownload then _G.UFO_StartDownload() end\ngui:Destroy();")
-  if n==0 then patched, n = src:gsub('btnSubmit.Text%s*=%s*"✅ Key accepted"','btnSubmit.Text="✅ Key accepted"\nif _G.UFO_StartDownload then _G.UFO_StartDownload() end'); end
-  if n>0 then src=patched end
-  local ok2,err=safe_loadstring(src,"UFOHubX_Key"); if not ok2 then log("Key UI run err: "..tostring(err)) end
-end
--- ============================================================================
+-- ไม่มีคีย์/หมดอายุ => แสดง UI คีย์
+show_key_ui()
