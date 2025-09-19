@@ -1,264 +1,261 @@
 --[[
-UI First Aid (Single Drop) - วางที่ StarterPlayerScripts (LocalScript)
-เป้าหมาย: บังคับให้ "หน้าคีย์" ของคุณโผล่ + วินิจฉัยสาเหตุถ้าไม่โผล่
-- ไม่เปลี่ยนหน้าตาเดิม (แค่เปิดใช้/ดันลำดับ/แก้ค่าปลอดภัย)
-- ถ้าไม่พบหน้าคีย์ จะสร้าง overlay เล็ก ๆ บอกทางแก้ พร้อมปุ่มรีเฟรช
-- กด Shift+K เพื่อสลับแสดง/ซ่อนหน้าคีย์อย่างแรง และพิมพ์ Debug Tree
+KeyGate - FULL UI (Single File)
+วางที่: StarterPlayer/StarterPlayerScripts (LocalScript)
+- สร้าง UI ให้ครบ (ScreenGui + Frame + KeyBox + SubmitBtn + StatusLabel)
+- รองรับเมาส์/ทัช/Enter, กันกดรัว, โทนสีปรับได้
+- ถ้ามี _G.UFO_VerifyKeyWithServer หรือ ReplicatedStorage.VerifyKeyRF จะใช้ของคุณอัตโนมัติ
+- ถ้าไม่มีฝั่งเซิร์ฟเวอร์ → โหมดทดสอบ (ผ่านชั่วคราว) เพื่อยืนยันว่าปุ่มและ UI ทำงาน
 
-ตั้งชื่อชิ้นส่วนมาตรฐาน (แก้ได้):
-  ScreenGui/Frame เดิมของคุณมี:
-    - TextBox:  "KeyBox"
-    - TextButton:"SubmitBtn"
-    - TextLabel: "StatusLabel"
+แก้ค่าที่ CONFIG ด้านล่างเพื่อปรับข้อความ/สี/ขนาดได้
 ]]--
 
----------------- CONFIG ----------------
-local KEYBOX_NAME      = "KeyBox"
-local SUBMITBTN_NAME   = "SubmitBtn"
-local STATUSLBL_NAME   = "StatusLabel"
-local FORCE_DISPLAY_ORDER = 1000   -- ดันให้สูงกว่าพวก overlay อื่น
-local FORCE_ZINDEX_BEHAV  = Enum.ZIndexBehavior.Sibling
-local IGNORE_GUI_INSET    = true
-local HOTKEY_TOGGLE       = Enum.KeyCode.K -- กด Shift+K เพื่อ toggle
----------------------------------------
+------------------ CONFIG ------------------
+local TITLE_TEXT        = "ใส่รหัสเพื่อเข้าใช้งาน"
+local PLACEHOLDER_TEXT  = "กรอกรหัสที่นี่..."
+local BUTTON_TEXT_IDLE  = "ยืนยัน"
+local BUTTON_TEXT_BUSY  = "กำลังตรวจสอบ..."
+local SUCCESS_TEXT      = "ยืนยันสำเร็จ"
+local TEST_MODE_TEXT    = "ยืนยันสำเร็จ (โหมดทดสอบ)"
+local ERROR_EMPTY_TEXT  = "กรุณากรอกรหัสก่อน"
+local ERROR_NET_TEXT    = "ติดต่อเซิร์ฟเวอร์ไม่ได้"
+local ERROR_FAIL_TEXT   = "รหัสไม่ถูกต้อง"
+
+-- สีธีม
+local COLOR_BG          = Color3.fromRGB(18, 22, 28)
+local COLOR_CARD        = Color3.fromRGB(28, 34, 42)
+local COLOR_ACCENT      = Color3.fromRGB(88, 180, 255)
+local COLOR_BTN         = Color3.fromRGB(120, 210, 140)
+local COLOR_TEXT        = Color3.fromRGB(235, 238, 243)
+local COLOR_MUTED       = Color3.fromRGB(170, 178, 188)
+local COLOR_OK          = Color3.fromRGB(40, 180, 80)
+local COLOR_ERR         = Color3.fromRGB(220, 60, 60)
+
+-- พฤติกรรม
+local DISPLAY_ORDER     = 500
+local COOLDOWN_SEC      = 0.35  -- กันกดรัว
+local CLOSE_ON_SUCCESS  = true  -- ปิด UI เมื่อยืนยันผ่าน
+--------------------------------------------
 
 local Players = game:GetService("Players")
-local UIS     = game:GetService("UserInputService")
 local RS      = game:GetService("RunService")
+local UIS     = game:GetService("UserInputService")
 local Rep     = game:GetService("ReplicatedStorage")
 
 local plr = Players.LocalPlayer
-local function waitForPlayerGui()
+local function getPlayerGui()
     local pg = plr:FindFirstChildOfClass("PlayerGui")
-    while not pg do
-        plr.ChildAdded:Wait()
-        pg = plr:FindFirstChildOfClass("PlayerGui")
-    end
+    while not pg do plr.ChildAdded:Wait(); pg = plr:FindFirstChildOfClass("PlayerGui") end
     return pg
 end
+local PlayerGui = getPlayerGui()
 
-local PlayerGui = waitForPlayerGui()
-
--- หา ScreenGui "หน้าคีย์" โดยเดาอิงจากโครงเดิม (มี SubmitBtn/KeyBox)
-local function findKeyScreenGui()
-    for _, sg in ipairs(PlayerGui:GetChildren()) do
-        if sg:IsA("ScreenGui") and sg.Enabled then
-            if sg:FindFirstChild(SUBMITBTN_NAME, true) or sg:FindFirstChild(KEYBOX_NAME, true) then
-                return sg
-            end
-        end
-    end
-    -- หาใน StarterGui แล้ว clone มาก็ได้
-    local StarterGui = game:GetService("StarterGui")
-    for _, sg in ipairs(StarterGui:GetChildren()) do
-        if sg:IsA("ScreenGui") then
-            if sg:FindFirstChild(SUBMITBTN_NAME, true) or sg:FindFirstChild(KEYBOX_NAME, true) then
-                local clone = sg:Clone()
-                clone.Parent = PlayerGui
-                return clone
-            end
-        end
-    end
-    -- หาใน ReplicatedStorage เผื่อเก็บไว้ที่นั่น
-    for _, sg in ipairs(Rep:GetChildren()) do
-        if sg:IsA("ScreenGui") then
-            if sg:FindFirstChild(SUBMITBTN_NAME, true) or sg:FindFirstChild(KEYBOX_NAME, true) then
-                local clone = sg:Clone()
-                clone.Parent = PlayerGui
-                return clone
-            end
-        end
-    end
-    return nil
+-- ถ้ามีของเก่า ค่อยๆ เคลียร์เพื่อไม่ให้ซ้อน
+do
+    local old = PlayerGui:FindFirstChild("__KeyGateUI")
+    if old then old:Destroy() end
 end
 
-local function listAt(x, y)
-    local list = UIS:GetGuiObjectsAtPosition(x,y)
-    print((">> GuiAt(%d,%d) top→down:"):format(x,y))
-    for i,g in ipairs(list) do
-        print(("  %02d) %s [Z=%d Vis=%s Class=%s]"):format(i, g:GetFullName(), g.ZIndex, tostring(g.Visible), g.ClassName))
-    end
-    return list
-end
+-- ===== สร้าง UI ทั้งชุด =====
+local sg = Instance.new("ScreenGui")
+sg.Name = "__KeyGateUI"
+sg.ResetOnSpawn = false
+sg.DisplayOrder = DISPLAY_ORDER
+sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+sg.IgnoreGuiInset = true
+sg.Parent = PlayerGui
 
-local function highlight(gui)
-    local box = Instance.new("Frame")
-    box.Name = "__UIFirstAidHighlight"
-    box.BorderSizePixel = 2
-    box.BackgroundTransparency = 1
-    box.BorderColor3 = Color3.fromRGB(255, 80, 80)
-    box.ZIndex = 999999
-    box.IgnoreGuiInset = true
-    box.Parent = PlayerGui
-    box.Size = UDim2.fromOffset(gui.AbsoluteSize.X, gui.AbsoluteSize.Y)
-    box.Position = UDim2.fromOffset(gui.AbsolutePosition.X, gui.AbsolutePosition.Y)
-    task.delay(0.5, function() box:Destroy() end)
-end
+-- พื้นหลัง
+local bg = Instance.new("Frame")
+bg.BackgroundColor3 = COLOR_BG
+bg.BackgroundTransparency = 0.1
+bg.Size = UDim2.fromScale(1,1)
+bg.Parent = sg
 
-local function makeOverlay(msg, onRefresh)
-    local overlay = Instance.new("ScreenGui")
-    overlay.Name = "__UIFirstAidOverlay"
-    overlay.ResetOnSpawn = false
-    overlay.DisplayOrder = FORCE_DISPLAY_ORDER + 10
-    overlay.ZIndexBehavior = FORCE_ZINDEX_BEHAV
-    overlay.IgnoreGuiInset = IGNORE_GUI_INSET
-    overlay.Parent = PlayerGui
+-- ทำให้ UI ปรับตามขนาดจอ
+local holder = Instance.new("Frame")
+holder.BackgroundTransparency = 1
+holder.Size = UDim2.fromScale(1,1)
+holder.Parent = bg
 
-    local frame = Instance.new("Frame")
-    frame.AnchorPoint = Vector2.new(0.5, 0.5)
-    frame.Position = UDim2.fromScale(0.5, 0.12)
-    frame.Size = UDim2.fromOffset(520, 86)
-    frame.BackgroundColor3 = Color3.fromRGB(25,25,25)
-    frame.BackgroundTransparency = 0.15
-    frame.BorderSizePixel = 0
-    frame.Parent = overlay
+local card = Instance.new("Frame")
+card.Name = "Card"
+card.AnchorPoint = Vector2.new(0.5, 0.5)
+card.Position = UDim2.fromScale(0.5, 0.5)
+card.Size = UDim2.fromOffset(520, 260)
+card.BackgroundColor3 = COLOR_CARD
+card.BorderSizePixel = 0
+card.Parent = holder
+local corner = Instance.new("UICorner", card); corner.CornerRadius = UDim.new(0, 16)
+local shadow = Instance.new("ImageLabel", card)
+shadow.BackgroundTransparency = 1
+shadow.Image = "rbxassetid://5028857084"
+shadow.ImageColor3 = Color3.fromRGB(0,0,0)
+shadow.ImageTransparency = 0.4
+shadow.ScaleType = Enum.ScaleType.Slice
+shadow.SliceCenter = Rect.new(24,24,276,276)
+shadow.Size = UDim2.new(1, 24, 1, 24)
+shadow.Position = UDim2.fromOffset(-12, -8)
+shadow.ZIndex = 0
 
-    local corner = Instance.new("UICorner", frame)
-    corner.CornerRadius = UDim.new(0, 10)
+local pad = Instance.new("UIPadding", card)
+pad.PaddingLeft   = UDim.new(0, 20)
+pad.PaddingRight  = UDim.new(0, 20)
+pad.PaddingTop    = UDim.new(0, 18)
+pad.PaddingBottom = UDim.new(0, 18)
 
-    local padding = Instance.new("UIPadding", frame)
-    padding.PaddingLeft  = UDim.new(0,12)
-    padding.PaddingRight = UDim.new(0,12)
-    padding.PaddingTop   = UDim.new(0,10)
-    padding.PaddingBottom= UDim.new(0,10)
+-- หัวข้อ
+local title = Instance.new("TextLabel")
+title.BackgroundTransparency = 1
+title.Text = TITLE_TEXT
+title.Font = Enum.Font.GothamBold
+title.TextSize = 24
+title.TextColor3 = COLOR_TEXT
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Size = UDim2.new(1, 0, 0, 34)
+title.Parent = card
 
-    local label = Instance.new("TextLabel")
-    label.BackgroundTransparency = 1
-    label.TextWrapped = true
-    label.TextXAlignment = Enum.TextXAlignment.Left
-    label.TextYAlignment = Enum.TextYAlignment.Top
-    label.Text = msg
-    label.Font = Enum.Font.GothamMedium
-    label.TextSize = 16
-    label.TextColor3 = Color3.fromRGB(245,245,245)
-    label.Size = UDim2.new(1, -130, 1, 0)
-    label.Parent = frame
+-- เส้นคั่น
+local sep = Instance.new("Frame")
+sep.BorderSizePixel = 0
+sep.BackgroundColor3 = COLOR_ACCENT
+sep.BackgroundTransparency = 0.4
+sep.Size = UDim2.new(1, 0, 0, 1)
+sep.Position = UDim2.fromOffset(0, 52)
+sep.Parent = card
 
-    local btn = Instance.new("TextButton")
-    btn.Text = "รีเฟรช UI"
-    btn.Font = Enum.Font.GothamBold
-    btn.TextSize = 16
-    btn.AutoButtonColor = true
-    btn.TextColor3 = Color3.fromRGB(20,20,20)
-    btn.Size = UDim2.fromOffset(110, 36)
-    btn.Position = UDim2.new(1, -110, 1, -36)
-    btn.BackgroundColor3 = Color3.fromRGB(140, 220, 140)
-    btn.BorderSizePixel = 0
-    btn.Parent = frame
-    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
+-- กล่องรหัส
+local keyBox = Instance.new("TextBox")
+keyBox.Name = "KeyBox"
+keyBox.PlaceholderText = PLACEHOLDER_TEXT
+keyBox.Text = ""
+keyBox.Font = Enum.Font.Gotham
+keyBox.TextSize = 18
+keyBox.TextColor3 = COLOR_TEXT
+keyBox.PlaceholderColor3 = COLOR_MUTED
+keyBox.BackgroundColor3 = Color3.fromRGB(35, 42, 52)
+keyBox.BorderSizePixel = 0
+keyBox.ClearTextOnFocus = false
+keyBox.Size = UDim2.new(1, -40, 0, 40)
+keyBox.Position = UDim2.fromOffset(20, 74)
+keyBox.Parent = card
+local kbCorner = Instance.new("UICorner", keyBox); kbCorner.CornerRadius = UDim.new(0, 10)
+local kbPad = Instance.new("UIPadding", keyBox); kbPad.PaddingLeft = UDim.new(0, 10)
 
-    btn.Activated:Connect(function()
-        if onRefresh then onRefresh() end
-        overlay:Destroy()
-    end)
+-- ปุ่มยืนยัน
+local submitBtn = Instance.new("TextButton")
+submitBtn.Name = "SubmitBtn"
+submitBtn.Text = BUTTON_TEXT_IDLE
+submitBtn.Font = Enum.Font.GothamBold
+submitBtn.TextSize = 18
+submitBtn.TextColor3 = Color3.fromRGB(20, 22, 24)
+submitBtn.BackgroundColor3 = COLOR_BTN
+submitBtn.AutoButtonColor = true
+submitBtn.BorderSizePixel = 0
+submitBtn.Size = UDim2.fromOffset(140, 40)
+submitBtn.Position = UDim2.fromOffset(card.AbsoluteSize.X - 160, 128) -- จะถูกจัดใหม่หลังวัดขนาด
+submitBtn.Parent = card
+local sbCorner = Instance.new("UICorner", submitBtn); sbCorner.CornerRadius = UDim.new(0, 10)
 
-    return overlay
-end
+-- สถานะ
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Name = "StatusLabel"
+statusLabel.BackgroundTransparency = 1
+statusLabel.Text = "กรอกรหัสแล้วกดปุ่มยืนยัน"
+statusLabel.Font = Enum.Font.Gotham
+statusLabel.TextSize = 16
+statusLabel.TextColor3 = COLOR_MUTED
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+statusLabel.Size = UDim2.new(1, -40, 0, 28)
+statusLabel.Position = UDim2.fromOffset(20, 176)
+statusLabel.Parent = card
 
-local function ensureVisible(sg)
-    if not sg then return end
-    sg.Enabled = true
-    sg.DisplayOrder = FORCE_DISPLAY_ORDER
-    sg.ZIndexBehavior = FORCE_ZINDEX_BEHAV
-    sg.IgnoreGuiInset = IGNORE_GUI_INSET
-    -- ถ้าเฟรมหลักถูกซ่อนจะบังคับให้ Visible = true
-    for _, d in ipairs(sg:GetDescendants()) do
-        if d:IsA("GuiObject") and d.Visible == false then
-            -- ไม่เปลี่ยนทุกชิ้น แต่ถ้าเป็น Container ใหญ่ ๆ ค่อยเปิด
-            if d:IsA("Frame") or d:IsA("ScrollingFrame") then
-                d.Visible = true
-            end
-        end
-    end
-end
-
-local function pushButtonSafe(btn)
-    if not (btn and btn:IsA("GuiButton")) then return end
-    btn.Active = true
-    btn.AutoButtonColor = true
-    btn.Modal = false
-    btn.ZIndex = math.max(btn.ZIndex, 10)
-end
-
--- === Main flow ===
-local keySG = findKeyScreenGui()
-
-if not keySG then
-    local ov
-    local function refresher()
-        keySG = findKeyScreenGui()
-        if keySG then
-            ensureVisible(keySG)
-            print("[UIFirstAid] พบหน้าคีย์แล้ว:", keySG:GetFullName())
-        else
-            print("[UIFirstAid] ยังไม่พบหน้าคีย์ ตรวจว่าอยู่ใน StarterGui/ReplicatedStorage หรือชื่อปุ่ม/กล่องถูกต้อง")
-        end
-    end
-    ov = makeOverlay(
-        "ไม่พบ 'หน้าคีย์' ตอนโหลด\n- ตรวจว่า ScreenGui ของหน้าคีย์อยู่ใน StarterGui\n- ให้มีชิ้นส่วนชื่อ '"..SUBMITBTN_NAME.."' หรือ '"..KEYBOX_NAME.."' อย่างน้อย 1 ชิ้น\n- กดปุ่มด้านขวาเพื่อลองรีเฟรชค้นหาอีกครั้ง",
-        refresher
-    )
-else
-    ensureVisible(keySG)
-    print("[UIFirstAid] ใช้งานหน้าคีย์:", keySG:GetFullName())
-end
-
--- ดันปุ่มให้ใช้งานได้จริง + พิมพ์เหตุที่อาจโดนทับ
-local function postCheck()
-    if not keySG then return end
-    local submitBtn = keySG:FindFirstChild(SUBMITBTN_NAME, true)
-    local keyBox    = keySG:FindFirstChild(KEYBOX_NAME, true)
-    local statusLbl = keySG:FindFirstChild(STATUSLBL_NAME, true)
-
-    if submitBtn then pushButtonSafe(submitBtn) end
-    if keyBox and keyBox:IsA("TextBox") then keyBox.ClearTextOnFocus = false end
-
-    -- สแกนตำแหน่งกึ่งกลางของปุ่มว่ามีอะไร "ทับ" มั้ย
-    if submitBtn and submitBtn.AbsoluteSize.X > 0 then
-        local center = submitBtn.AbsolutePosition + submitBtn.AbsoluteSize/2
-        local list = listAt(center.X, center.Y)
-        if #list > 0 and list[1] ~= submitBtn then
-            print("[UIFirstAid] ตัวบนสุดที่รับคลิกไม่ใช่ปุ่มของคุณ → มีของทับอยู่ (ไฮไลต์ให้ 0.5 วินาที)")
-            highlight(list[1])
-        end
-    end
-
-    -- สร้างข้อความเริ่มต้นให้ผู้เล่นรู้ว่าต้องทำอะไร
-    if statusLbl and statusLbl:IsA("TextLabel") then
-        statusLbl.Text = "กรอกรหัสแล้วกดปุ่มยืนยัน"
-        statusLbl.TextColor3 = Color3.fromRGB(245,245,245)
-    end
-end
-
--- ทำหลังเฟรมเรนเดอร์เพื่อให้ AbsolutePosition/Size ถูกต้อง
+-- จัดปุ่มให้ชิดขวาอัตโนมัติหลังวัดขนาด
 RS.Heartbeat:Wait()
-postCheck()
+submitBtn.Position = UDim2.fromOffset(card.AbsoluteSize.X - submitBtn.AbsoluteSize.X - 20, 128)
 
--- Hotkey: Shift+K → toggle หน้าคีย์ + dump debug
-UIS.InputBegan:Connect(function(input, gp)
-    if gp then return end
-    if input.KeyCode == HOTKEY_TOGGLE and UIS:IsKeyDown(Enum.KeyCode.LeftShift) or UIS:IsKeyDown(Enum.KeyCode.RightShift) then
-        if keySG then
-            keySG.Enabled = not keySG.Enabled
-            print("[UIFirstAid] Toggle ScreenGui.Enabled →", keySG.Enabled)
-            if keySG.Enabled then
-                ensureVisible(keySG)
-                postCheck()
-            end
+-- ตั้งค่าให้พร้อมคลิก
+submitBtn.Active = true
+submitBtn.Modal = false
+submitBtn.ZIndex = math.max(submitBtn.ZIndex, 10)
+
+-- ===== ฟังก์ชันช่วย =====
+local busy, lastClick = false, 0
+local function setStatus(text, ok)
+    statusLabel.Text = text or ""
+    if ok == nil then return end
+    statusLabel.TextColor3 = ok and COLOR_OK or COLOR_ERR
+end
+local function setBusy(isBusy, text)
+    busy = isBusy
+    submitBtn.Text = isBusy and BUTTON_TEXT_BUSY or BUTTON_TEXT_IDLE
+    submitBtn.Active = not isBusy
+    submitBtn.AutoButtonColor = not isBusy
+    if text then setStatus(text) end
+end
+
+-- ตรวจช่องทางยืนยันคีย์
+local mode, VerifyRF = "local", nil
+if typeof(_G)=="table" and typeof(_G.UFO_VerifyKeyWithServer)=="function" then
+    mode = "global"
+else
+    local rf = Rep:FindFirstChild("VerifyKeyRF")
+    if rf and rf:IsA("RemoteFunction") then
+        mode, VerifyRF = "remote", rf
+    end
+end
+
+local function verifyKey(k)
+    k = (k or ""):match("^%s*(.-)%s*$")
+    if k == "" then return false, ERROR_EMPTY_TEXT end
+    if mode == "global" then
+        local ok,res = pcall(function() return _G.UFO_VerifyKeyWithServer(k) end)
+        if not ok then return false, ERROR_NET_TEXT end
+        if type(res)=="table" then
+            return res.ok==true, res.message or (res.ok and SUCCESS_TEXT or ERROR_FAIL_TEXT)
+        else
+            return res==true, (res==true and SUCCESS_TEXT or ERROR_FAIL_TEXT)
         end
+    elseif mode == "remote" and VerifyRF then
+        local ok,res = pcall(function() return VerifyRF:InvokeServer(k) end)
+        if not ok then return false, ERROR_NET_TEXT end
+        if type(res)=="table" then
+            return res.ok==true, res.message or (res.ok and SUCCESS_TEXT or ERROR_FAIL_TEXT)
+        else
+            return res==true, (res==true and SUCCESS_TEXT or ERROR_FAIL_TEXT)
+        end
+    else
+        return true, TEST_MODE_TEXT
     end
-end)
+end
 
--- เฝ้า: ถ้าหน้าคีย์ถูก Disable/ทำหายตอนรีสปอน → เปิดคืนอัตโนมัติ
-PlayerGui.ChildRemoved:Connect(function(child)
-    if child == keySG then
-        task.defer(function()
-            keySG = findKeyScreenGui()
-            if keySG then
-                ensureVisible(keySG)
-                print("[UIFirstAid] หน้าคีย์ถูกลบ → กู้คืนแล้ว:", keySG:GetFullName())
-                postCheck()
-            end
-        end)
+local function doSubmit()
+    if busy then return end
+    local now = os.clock()
+    if now - lastClick < COOLDOWN_SEC then return end
+    lastClick = now
+
+    local text = keyBox.Text or ""
+    if text == "" then setStatus(ERROR_EMPTY_TEXT, false); return end
+
+    setBusy(true, "กำลังตรวจสอบรหัส...")
+    local ok,msg = verifyKey(text)
+    if ok then
+        setStatus(msg or SUCCESS_TEXT, true)
+        task.wait(0.2)
+        if typeof(_G)=="table" and typeof(_G.UFO_GoNext)=="function" then pcall(_G.UFO_GoNext) end
+        if CLOSE_ON_SUCCESS then sg.Enabled = false end
+    else
+        setBusy(false, msg or ERROR_FAIL_TEXT)
+        setStatus(msg or ERROR_FAIL_TEXT, false)
     end
+end
+
+-- bind ปุ่ม + Enter
+submitBtn.Activated:Connect(doSubmit)
+if submitBtn.MouseButton1Click then submitBtn.MouseButton1Click:Connect(doSubmit) end
+keyBox.FocusLost:Connect(function(enter) if enter then doSubmit() end end)
+
+-- โฟกัสกล่องทันทีบนคีย์บอร์ด/พีซี
+task.defer(function()
+    if not UIS.TouchEnabled then keyBox:CaptureFocus() end
 end)
