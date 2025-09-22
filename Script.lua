@@ -1,204 +1,234 @@
---[[  UFO HUB X — Multi-Map, Language Picker, No-Key Boot
-     - แมพไม่รองรับ -> ไม่ทำอะไรเลย
-     - แมพรองรับ -> เลือกภาษา (TH/EN + ธง) -> รัน GameCore -> Main UI -> MAX -> Map Script ตามภาษา
-     - จำภาษาที่เลือกไว้ในไฟล์ UFOHubX/lang.json
-]]
-
 --========================================================
--- Services / Utils
+-- UFO HUB X — Multi-Map Boot (No Key, Lang Picker → Download → Main UI → Map Script)
 --========================================================
-local HttpService = game:GetService("HttpService")
-local UIS         = game:GetService("UserInputService")
+local HttpService  = game:GetService("HttpService")
+local UIS          = game:GetService("UserInputService")
+local CG           = game:GetService("CoreGui")
 
 local function log(s)
-    s = "[UFO-MULTI] "..tostring(s)
+    s = "[UFO-HUB-X] "..tostring(s)
     if rconsoleprint then rconsoleprint(s.."\n") else print(s) end
 end
 
+-- ---------------- HTTP helpers ----------------
 local function http_get(url)
     if http and http.request then
-        local ok,res = pcall(http.request,{Url=url,Method="GET"})
+        local ok,res = pcall(http.request,{Url=url, Method="GET"})
         if ok and res and (res.Body or res.body) then return true,(res.Body or res.body) end
     end
     if syn and syn.request then
-        local ok,res = pcall(syn.request,{Url=url,Method="GET"})
+        local ok,res = pcall(syn.request,{Url=url, Method="GET"})
         if ok and res and (res.Body or res.body) then return true,(res.Body or res.body) end
     end
     local ok,body = pcall(function() return game:HttpGet(url) end)
     if ok and body then return true,body end
-    return false,"http_failed"
+    return false,"httpget_failed"
 end
 
-local function http_get_retry(urls, tries, gap)
+local function http_get_retry(urls, tries, delay_s)
     local list = type(urls)=="table" and urls or {urls}
-    tries, gap = tries or 3, gap or 0.7
-    local n=0
+    tries   = tries or 3
+    delay_s = delay_s or 0.6
+    local attempt = 0
     for r=1,tries do
         for _,u in ipairs(list) do
-            n+=1; log(("GET try#%d %s"):format(n,u))
+            attempt += 1
+            log(("HTTP try #%d → %s"):format(attempt,u))
             local ok,body = http_get(u)
             if ok and body then return true,body,u end
         end
-        task.wait(gap*r)
+        task.wait(delay_s * r)
     end
-    return false,"retry_fail"
+    return false,"retry_failed"
 end
 
 local function safe_run(src, tag)
-    local f,e=loadstring(src, tag or "chunk")
-    if not f then return false,"load: "..tostring(e) end
-    local ok,err=pcall(f)
-    if not ok then return false,"pcall: "..tostring(err) end
+    local f, e = loadstring(src, tag or "chunk")
+    if not f then return false, "loadstring: "..tostring(e) end
+    local ok, err = pcall(f)
+    if not ok then return false, "pcall: "..tostring(err) end
     return true
 end
 
---========================================================
--- File state (จำภาษา)
---========================================================
-local DIR       = "UFOHubX"
-local LANG_FILE = DIR.."/lang.json"
-if isfolder and not isfolder(DIR) then pcall(makefolder,DIR) end
+-- ---------------- Config: URLs ----------------
+-- (1) ตัวบูตกลาง MAX (วิ่งเสมอ ก่อนเช็คแมพ)
+local URL_RUN_ALL = "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X-MAX/refs/heads/main/Script.lua"
 
-local function readLang()
-    if not (isfile and isfile(LANG_FILE)) then return nil end
-    local ok,raw=pcall(readfile,LANG_FILE); if not ok or not raw then return nil end
-    local ok2,js=pcall(function() return HttpService:JSONDecode(raw) end)
-    if ok2 and js and js.lang then return js.lang end
-    return nil
-end
-local function saveLang(code)
-    if not writefile then return end
-    local ok,raw=pcall(function() return HttpService:JSONEncode({lang=code, saved_at=os.time()}) end)
-    if ok then pcall(writefile, LANG_FILE, raw) end
-end
-
---========================================================
--- URLs กลาง
---========================================================
--- 1) ระบบเกมรวม (Boot ของโปรเจกต์เกมรวม)
-local URL_GAME_BOOT = {
-    "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X-Game/refs/heads/main/Boot.lua",
+-- (2) หน้าดาวน์โหลด + UI หลัก
+local URL_DOWNLOADS = {
+    "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X-2/refs/heads/main/UFO%20HUB%20X%20Download.lua",
 }
--- 2) UI หน้าหลัก
-local URL_MAIN_UI = {
+local URL_MAINS = {
     "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X-3/refs/heads/main/UFO%20HUB%20X%20UI.lua",
 }
--- 3) MAX Script รวม
-local URL_MAX_SCRIPT = {
-    "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X-MAX/refs/heads/main/Script.lua",
-}
 
---========================================================
--- ตารางรองรับหลายแมพ + ภาษา (เติมแมพใหม่ ๆ ต่อท้ายได้)
---   key = PlaceId, value = { name="...", th="<raw>", en="<raw>" }
---========================================================
-local MAPS = {
-    [105555311806207] = {
+-- (3) รายการแมพที่รองรับ + สคริปต์แยกภาษา
+local SUPPORTED_MAPS = {
+    -- Build a Zoo
+    ["105555311806207"] = {
         name = "Build a Zoo",
-        en   = "https://raw.githubusercontent.com/UFO-HUB-X-Studio/Build-a-Zoo-EN/refs/heads/main/Build%20a%20Zoo%20EN.lua",
-        th   = "https://raw.githubusercontent.com/UFO-HUB-X-Studio/Build-a-Zoo-TH/refs/heads/main/Build%20a%20Zoo%20TH.lua",
+        TH = "https://raw.githubusercontent.com/UFO-HUB-X-Studio/Build-a-Zoo-TH/refs/heads/main/Build%20a%20Zoo%20TH.lua",
+        EN = "https://raw.githubusercontent.com/UFO-HUB-X-Studio/Build-a-Zoo-EN/refs/heads/main/Build%20a%20Zoo%20EN.lua",
     },
+    -- เพิ่มแมพอื่น ๆ ต่อได้รูปแบบเดียวกัน
 }
 
---========================================================
--- Language Picker UI (เล็ก ๆ + ธง)
---========================================================
-local function showLangPicker()
-    local CG = game:GetService("CoreGui")
-    local scr = Instance.new("ScreenGui")
-    scr.Name="UFO_LangPicker"; scr.IgnoreGuiInset=true; scr.ResetOnSpawn=false
+-- ---------------- UI helpers ----------------
+local function make(class, props, kids)
+    local o = Instance.new(class)
+    for k,v in pairs(props or {}) do
+        local ok,err = pcall(function() o[k]=v end)
+        if not ok then warn("[UFO] prop set err:",k,err) end
+    end
+    for _,c in ipairs(kids or {}) do c.Parent = o end
+    return o
+end
+
+local function SOFT_PARENT(gui)
+    if not gui then return end
+    pcall(function()
+        if gui:IsA("ScreenGui") then
+            gui.Enabled=true
+            gui.DisplayOrder=999999
+            gui.ResetOnSpawn=false
+            gui.IgnoreGuiInset=true
+            gui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
+        end
+    end)
     local ok=false
-    if gethui then ok=pcall(function() scr.Parent=gethui() end) end
-    if not ok then scr.Parent=CG end
+    if gethui then ok=pcall(function() gui.Parent = gethui() end) end
+    if (not ok) or (not gui.Parent) then ok=pcall(function() gui.Parent = CG end) end
+    if (not ok) or (not gui.Parent) then
+        local pg = game.Players.LocalPlayer and (game.Players.LocalPlayer:FindFirstChildOfClass("PlayerGui") or game.Players.LocalPlayer:WaitForChild("PlayerGui",2))
+        if pg then pcall(function() gui.Parent = pg end) end
+    end
+end
 
-    local panel=Instance.new("Frame",scr)
-    panel.AnchorPoint=Vector2.new(0.5,0.5)
-    panel.Position=UDim2.fromScale(0.5,0.5)
-    panel.Size=UDim2.fromOffset(420,160)
-    panel.BackgroundColor3=Color3.fromRGB(12,12,12)
-    panel.BorderSizePixel=0
-    Instance.new("UICorner",panel).CornerRadius=UDim.new(0,16)
-    local st=Instance.new("UIStroke",panel); st.Color=Color3.fromRGB(0,255,140); st.Transparency=0.25
+-- ---------------- Language Picker ----------------
+local function showLanguagePicker(mapName, onPick)
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "UFOX_LangPicker"
+    SOFT_PARENT(gui)
 
-    local title=Instance.new("TextLabel",panel)
-    title.BackgroundTransparency=1; title.Position=UDim2.new(0,0,0,14); title.Size=UDim2.new(1,0,0,28)
-    title.Text="Choose your language"; title.Font=Enum.Font.GothamBlack; title.TextSize=22
-    title.TextColor3=Color3.fromRGB(230,230,230)
+    local panel = make("Frame",{
+        Parent=gui, AnchorPoint=Vector2.new(0.5,0.5), Position=UDim2.fromScale(0.5,0.5),
+        Size=UDim2.fromOffset(520,240), BackgroundColor3=Color3.fromRGB(12,12,12), BorderSizePixel=0
+    },{
+        make("UICorner",{CornerRadius=UDim.new(0,18)}),
+        make("UIStroke",{Color=Color3.fromRGB(0,255,170), Transparency=0.75, Thickness=2})
+    })
 
-    local row=Instance.new("Frame",panel); row.BackgroundTransparency=1; row.Position=UDim2.new(0,20,0,64); row.Size=UDim2.new(1,-40,0,72)
-    local list=Instance.new("UIListLayout",row); list.FillDirection=Enum.FillDirection.Horizontal; list.Padding=UDim.new(0,20)
-    list.HorizontalAlignment=Enum.HorizontalAlignment.Center; list.VerticalAlignment=Enum.VerticalAlignment.Center
+    make("TextLabel",{
+        Parent=panel, BackgroundTransparency=1, Size=UDim2.new(1,0,0,44), Position=UDim2.new(0,0,0,14),
+        Font=Enum.Font.GothamBlack, TextSize=22,
+        Text=("Select Language for %s"):format(mapName or "Map"),
+        TextColor3=Color3.fromRGB(220,255,240)
+    },{})
 
-    local function makeBtn(txt, flagId)
-        local b=Instance.new("TextButton"); b.Parent=row; b.Size=UDim2.fromOffset(160,64)
-        b.AutoButtonColor=false; b.BackgroundColor3=Color3.fromRGB(26,26,26); b.Text=""
-        Instance.new("UICorner",b).CornerRadius=UDim.new(0,12)
-        local s=Instance.new("UIStroke",b); s.Color=Color3.fromRGB(80,180,140); s.Transparency=0.4
-        local img=Instance.new("ImageLabel",b); img.BackgroundTransparency=1; img.Size=UDim2.new(0,32,0,32); img.Position=UDim2.new(0,16,0.5,-16)
-        img.Image = flagId or "rbxassetid://14278548871" -- เปลี่ยนเป็น asset id ธงที่ชอบได้
-        local lab=Instance.new("TextLabel",b); lab.BackgroundTransparency=1; lab.Position=UDim2.new(0,56,0,0); lab.Size=UDim2.new(1,-64,1,0)
-        lab.Font=Enum.Font.GothamBold; lab.TextSize=20; lab.TextXAlignment=Enum.TextXAlignment.Left; lab.TextColor3=Color3.fromRGB(230,230,230); lab.Text=txt
+    local row = make("Frame",{
+        Parent=panel, BackgroundTransparency=1, Size=UDim2.new(1, -40, 0, 130), Position=UDim2.new(0,20,0,80)
+    },{})
+    make("UIListLayout",{
+        Parent=row, FillDirection=Enum.FillDirection.Horizontal, Padding=UDim.new(0,14),
+        HorizontalAlignment=Enum.HorizontalAlignment.Center, VerticalAlignment=Enum.VerticalAlignment.Center
+    },{})
+
+    local function langButton(txt, sub, color)
+        local b = make("TextButton",{
+            Parent=row, AutoButtonColor=true,
+            Size=UDim2.new(0.5,-7,1,0), BackgroundColor3=color or Color3.fromRGB(30,30,30),
+            Font=Enum.Font.GothamBlack, TextSize=20, Text=txt, TextColor3=Color3.new(1,1,1)
+        },{
+            make("UICorner",{CornerRadius=UDim.new(0,14)}),
+            make("UIStroke",{Color=Color3.fromRGB(255,255,255), Transparency=0.85})
+        })
+        make("TextLabel",{
+            Parent=b, BackgroundTransparency=1, AnchorPoint=Vector2.new(0.5,1), Position=UDim2.new(0.5,0,1,-8),
+            Size=UDim2.new(1,-20,0,16), Font=Enum.Font.Gotham, TextSize=14, Text=sub or "", TextColor3=Color3.fromRGB(230,230,230)
+        },{})
         return b
     end
 
-    local btnTH = makeBtn("ภาษาไทย 🇹🇭", "rbxassetid://14278548871")
-    local btnEN = makeBtn("English 🇬🇧", "rbxassetid://14278549254")
+    local btnTH = langButton("ภาษาไทย 🇹🇭", "Thai", Color3.fromRGB(36,48,70))
+    local btnEN = langButton("English 🇺🇸", "English", Color3.fromRGB(48,36,36))
 
-    local chosen=nil
-    btnTH.MouseButton1Click:Connect(function() chosen="th"; scr:Destroy() end)
-    btnEN.MouseButton1Click:Connect(function() chosen="en"; scr:Destroy() end)
+    local done = false
+    local function pick(code)
+        if done then return end
+        done = true
+        pcall(function() gui:Destroy() end)
+        if onPick then onPick(code) end
+    end
+    btnTH.MouseButton1Click:Connect(function() pick("TH") end)
+    btnEN.MouseButton1Click:Connect(function() pick("EN") end)
 
-    UIS.InputBegan:Connect(function(i,gpe) if not gpe and i.KeyCode==Enum.KeyCode.Escape then scr:Destroy() end end)
-    repeat task.wait(0.05) until not scr.Parent
-    return chosen
+    return gui
 end
 
---========================================================
--- Boot sequence
---========================================================
-local placeId = game.PlaceId
-local entry   = MAPS[placeId]
-
-if not entry then
-    log(("Place %s not supported → do nothing."):format(tostring(placeId)))
-    return
+-- ---------------- Download → Main → Map chain ----------------
+local function startDownloadThenMain(onMainReady)
+    local ok, src = http_get_retry(URL_DOWNLOADS, 5, 0.8)
+    if not ok then
+        log("Download UI fetch failed → open Main directly")
+        local okm, srcm = http_get_retry(URL_MAINS, 5, 0.8)
+        if okm then safe_run(srcm, "UFOHubX_Main") end
+        if onMainReady then onMainReady() end
+        return
+    end
+    -- แพตช์ให้จบแล้วเรียก Main เสมอ
+    local patched = src
+    local injected = 0
+    patched, injected = patched:gsub(
+        "gui:Destroy%(%);?",
+        [[
+if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
+gui:Destroy();
+]]
+    )
+    _G.UFO_ShowMain = function()
+        if _G.__UFO_Main_Started then return end
+        _G.__UFO_Main_Started = true
+        local okm, srcm = http_get_retry(URL_MAINS, 5, 0.8)
+        if okm then safe_run(srcm, "UFOHubX_Main") end
+        if onMainReady then onMainReady() end
+    end
+    safe_run(patched, "UFOHubX_Download")
 end
 
-log(("Place supported: %s (%s)"):format(entry.name or "?", tostring(placeId)))
-
--- เลือกภาษา (อ่านจากไฟล์ก่อน ถ้าไม่มีให้ถาม)
-local lang = readLang()
-if lang ~= "th" and lang ~= "en" then
-    lang = showLangPicker() or "en"
-    saveLang(lang)
+local function runMapScript(url)
+    if not url or #url==0 then return end
+    local ok, src = http_get_retry(url, 4, 0.7)
+    if not ok then log("Map script load failed: "..tostring(url)) return end
+    safe_run(src, "UFOHubX_Map")
 end
 
--- เลือก URL ตามภาษา
-local mapURL = (lang=="th" and entry.th) or entry.en or entry.th
-if not mapURL then
-    log("No script URL for selected language → abort.")
-    return
-end
-
-local function run_url_list(name, urls)
-    local ok,src = http_get_retry(urls, 5, 0.8)
-    if not ok then log(name.." fetch failed."); return false end
-    local ok2,err = safe_run(src, name)
-    if not ok2 then log(name.." run failed: "..tostring(err)); return false end
-    log(name.." started."); return true
-end
-
--- 1) ระบบเกมรวม
-run_url_list("GameCore", URL_GAME_BOOT)
--- 2) UI หลัก
-run_url_list("MainUI", URL_MAIN_UI)
--- 3) MAX Script รวม
-run_url_list("MAX", URL_MAX_SCRIPT)
--- 4) Map Script ตามภาษา
+-- ---------------- Boot flow ----------------
+-- 0) รันสคริปต์รวม MAX เสมอ
 do
-    local ok, src = http_get(mapURL)
-    if not ok then log("Map script fetch failed.") return end
-    local ok2, err = safe_run(src, (entry.name or "Map").."_"..lang)
-    if not ok2 then log("Map script run failed: "..tostring(err)) return end
-    log("Map script started.")
+    local ok, src = http_get_retry(URL_RUN_ALL, 3, 0.6)
+    if ok then
+        local ok2, err = safe_run(src, "UFOHubX_MAX_All")
+        if not ok2 then log("MAX run error: "..tostring(err)) end
+    else
+        log("MAX bundle fetch failed (continue anyway).")
+    end
 end
+
+-- 1) เช็คว่าแมพรองรับไหม
+local placeId = tostring(game.PlaceId or "")
+local cfg = SUPPORTED_MAPS[placeId]
+if not cfg then
+    -- ไม่รองรับแมพ ⇒ ไม่แสดงอะไรเลย
+    log("Map not supported. Boot ends silently.")
+    return
+end
+
+-- 2) ถ้ารองรับ ⇒ ให้เลือกภาษา ก่อนขึ้น Download → Main → Map
+showLanguagePicker(cfg.name or ("Place "..placeId), function(lang)
+    local langKey = (lang == "TH") and "TH" or "EN"
+    local mapURL  = cfg[langKey]
+    -- ลุย: Download → Main → Map
+    startDownloadThenMain(function()
+        runMapScript(mapURL)
+    end)
+end)
