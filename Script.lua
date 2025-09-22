@@ -127,10 +127,8 @@ end
 --========================================================
 -- ตั้งค่าโดเมนเซิร์ฟเวอร์ของคุณ (เช่น Render / Vercel)
 local SERVER_BASES = {
-    -- เปลี่ยนตัวนี้เป็นโดเมนของโปรเจ็กต์ server-key ของคุณ (มี /getkey, /verify)
     "https://ufo-hub-x-key-umoq.onrender.com",
 }
--- อนุญาต override จาก getgenv():
 do
     local gv = (getgenv and getgenv().UFO_SERVER_BASES)
     local g1 = (getgenv and getgenv().UFO_SERVER_BASE)
@@ -141,7 +139,6 @@ do
     end
 end
 
--- helper JSON (แยกจาก http_get ที่มีอยู่ เพื่อไม่กระทบของเดิม)
 local function _json_get_once(url)
     local ok, body = http_get(url)
     if not ok or not body then return false, nil, "http_error" end
@@ -164,7 +161,6 @@ local function json_get_with_failover(path_qs)
     return false, nil, last_err
 end
 
--- เรียก /verify ที่เซิร์ฟเวอร์ → คืน (ok, expires_at|nil, reason|nil)
 local function serverVerifyKey(key)
     key = tostring(key or "")
     if #key == 0 then return false, nil, "no_key" end
@@ -182,29 +178,24 @@ local function serverVerifyKey(key)
     end
 end
 
--- ถ้าคีย์เพิ่งผ่าน KEY_OK แต่ยังไม่มี expires_at ในไฟล์ → ขอจาก server แล้วบันทึก
 local function ensureSavedExpireAfterKeyOK()
     local st = readState()
     local hasExp = (st and st.expires_at and type(st.expires_at)=="number")
     if hasExp then return end
-
     local k = (_G and _G.UFO_HUBX_KEY) or (st and st.key)
     if not k or #tostring(k)==0 then
         log("KEY_OK but no key value to reverify; skip ensureSavedExpireAfterKeyOK()")
         return
     end
-
     local ok, exp, reason = serverVerifyKey(k)
     if ok then
         _G.UFO_SaveKeyState(k, exp or nil, false)
         log(("ensureSavedExpire: saved exp=%s"):format(tostring(exp)))
     else
-        -- ถ้าเซิร์ฟเวอร์ล่ม แต่ KEY_OK มาแล้ว ก็ไปต่อได้ (ยังเปิดดาวน์โหลด/เมนได้)
         log(("ensureSavedExpire: verify fail (%s), continue without exp"):format(tostring(reason)))
     end
 end
 
--- ตัวเลือก revalidate ตอนบูต (ค่าเริ่มต้นปิด เพื่อคงพฤติกรรมเดิม 100%)
 local REVALIDATE_ON_BOOT = (getgenv and getgenv().UFO_REVALIDATE_ON_BOOT) and true or false
 
 --========================================================
@@ -271,7 +262,6 @@ _G.UFO_StartDownload = function()
         if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
         return
     end
-    -- Patch Download UI: เรียก UFO_ShowMain ตอนจบเสมอ
     do
         local patched = src
         local injected = 0
@@ -313,6 +303,41 @@ _G.UFO_ShowMain = function()
     end
 end
 
+----------------------------------------------------------------
+-- [ADD-ON] DOWNLOAD-FIRST MODE (ซ่อน Key UI ชั่วคราว + เปิด Download ก่อน)
+-- วางหลังประกาศ _G.UFO_StartDownload/_G.UFO_ShowMain (เราใส่ไว้ตรงนี้แล้ว)
+-- ไม่ลบ/ไม่แก้ของเดิม แค่ short-circuit ให้ไปหน้า Download เลย
+----------------------------------------------------------------
+do
+    if not _G.__UFOX_DOWNLOAD_FIRST then
+        _G.__UFOX_DOWNLOAD_FIRST = true
+
+        -- กัน Force Key UI เผลอเปิด
+        FORCE_KEY_UI = false
+
+        -- เขียน state แบบถาวร (กันระบบอื่นเข้าใจผิดว่า key หมดอายุ)
+        local TEN_YEARS = 10 * 365 * 24 * 3600
+        local now = os.time()
+        local st = readState() or {}
+        st.key        = st.key or "UFO-DOWNLOAD-FIRST"
+        st.permanent  = true
+        st.expires_at = (st.expires_at and type(st.expires_at)=="number") and st.expires_at or (now + TEN_YEARS)
+        writeState(st)
+
+        -- reset flags
+        _G.__UFO_Download_Started = false
+        _G.__UFO_Main_Started     = false
+
+        -- เปิดหน้า Download UI ทันที (จบแล้วจะ call UFO_ShowMain เอง)
+        if _G and _G.UFO_StartDownload then
+            _G.UFO_StartDownload()
+        end
+
+        -- หยุดส่วนถัดไปทั้งหมดของไฟล์นี้ชั่วคราว (Key/Watchers/Boot-Flow จะไม่รัน)
+        return
+    end
+end
+
 --========================================================
 -- Watchers / Fallback หลายชั้น
 --========================================================
@@ -323,7 +348,6 @@ local function startKeyWatcher(timeout_sec)
         while (os.clock() - t0) < timeout_sec do
             if _G and _G.UFO_HUBX_KEY_OK then
                 log("Watcher: KEY_OK detected → ensure expires → start download")
-                -- [ADDED] ถ้ายังไม่มี expires ใน state ให้ถาม server แล้วบันทึก
                 pcall(ensureSavedExpireAfterKeyOK)
                 if _G and _G.UFO_StartDownload then _G.UFO_StartDownload() end
                 return
@@ -379,7 +403,6 @@ end
 --========================================================
 startUltimateWatchdog(180)
 
--- Force Key First (บังคับ Key UI ก่อนเสมอถ้าไม่ตั้งค่าเอง)
 do
     local env = (getgenv and getgenv().UFO_FORCE_KEY_UI)
     if env == nil then
@@ -390,18 +413,15 @@ do
 end
 
 local cur   = readState()
--- [ADDED] (ตัวเลือก) revalidate กับ server ตอนบูต (ค่าเริ่มต้นปิด เพื่อคงพฤติกรรมเดิม)
 if REVALIDATE_ON_BOOT and cur and cur.key and not (cur.permanent==true) then
     local ok, exp = serverVerifyKey(cur.key)
     if ok then
-        -- ต่ออายุจาก server (หรือคงเดิมถ้า server ให้ค่าเดิม)
         _G.UFO_SaveKeyState(cur.key, exp or cur.expires_at, false)
         cur = readState()
     end
 end
 local valid = isKeyStillValid(cur)
 
--- ======= โหมดบังคับ Key UI ก่อนเสมอ =======
 if FORCE_KEY_UI then
     log("FORCE_KEY_UI = true → show Key UI (first)")
     startKeyWatcher(120)
@@ -415,7 +435,6 @@ if FORCE_KEY_UI then
     do
         local patched = src
         local injected = 0
-        -- FIX: เรียก Download เฉพาะเมื่อ KEY_OK จริง
         patched, injected = patched:gsub(
             "gui:Destroy%(%);?",
             [[
@@ -424,7 +443,6 @@ gui:Destroy();
 ]]
         )
         if injected == 0 then
-            -- สำรอง: inject หลังข้อความ "✅ Key accepted"
             patched, injected = patched:gsub(
                 'btnSubmit.Text%s*=%s*"✅ Key accepted"',
                 [[btnSubmit.Text = "✅ Key accepted"
@@ -444,7 +462,6 @@ if _G and _G.UFO_StartDownload then _G.UFO_StartDownload() end
     return
 end
 
--- ======= โหมดปกติ (ไม่ force) =======
 if valid then
     log("Key valid → skip Key UI → go Download")
     _G.UFO_HUBX_KEY_OK   = true
@@ -493,7 +510,6 @@ else
     do
         local patched = src
         local injected = 0
-        -- FIX: เรียก Download เฉพาะเมื่อ KEY_OK จริง
         patched, injected = patched:gsub(
             "gui:Destroy%(%);?",
             [[
